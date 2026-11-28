@@ -58,8 +58,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     runsHang: false,
     asked: [] as string[],
     watched: {} as Record<string, string>,         // the head a ship_gate watch accepted, by pull request (merge.ts watchAccepted)
-    budget: null as null | { limit: number; remaining: number; reset: number },   // (0.19.3) what is left of GitHub's hour; null: unknown
+    budget: null as null | { limit: number; remaining: number; reset: number },   // (0.19.4) what is left of GitHub's hour; null: unknown
     budgetAsked: 0,
+    budgetViews: [] as (string | undefined)[],      // (0.19.4) who asked: "card", or the tap's landing (undefined)
+    holds: {} as Record<string, number | null>,     // (0.19.4) what taps hold of the hour, by key (null: let go)
   };
   // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
   const reviews = { list: [] as Reviewed[] | null };
@@ -183,7 +185,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       : github.runs); } : undefined,
     gateWatch: opts.gateWatch ?? ((pr: string) => (github.watched[pr] ? [github.watched[pr]] : [])),
     ...(opts.gateHead ? { gateHead: opts.gateHead } : {}),
-    budget: async () => { github.budgetAsked++; return github.budget ? copy(github.budget) : null; },
+    budget: async (view?: "card") => { github.budgetAsked++; github.budgetViews.push(view); return github.budget ? copy(github.budget) : null; },
+    hold: (key: string, until: number | null) => { github.holds[key] = until; },
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,

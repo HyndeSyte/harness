@@ -23,18 +23,21 @@ const TESTS_YML = ".github/workflows/tests.yml";
 
 export interface Git { code: number; out: string; err: string }
 export interface MergeDeps {
-  api: (path: string) => Promise<{ status: number; body: any; headers?: Record<string, string> }>;     // GET https://api.github.com<path> (headers lower-cased, where read)
+  // GET https://api.github.com<path> (headers lower-cased, where read); o.confirm (0.19.4, budget.ts): an attempt's job list may be kept
+  api: (path: string, o?: ApiOpts) => Promise<{ status: number; body: any; headers?: Record<string, string> }>;
   git: (args: string[], o?: { ssh?: boolean; timeoutMs?: number }) => Promise<Git>;
   stopped: () => boolean;
   remote?: (repo: string) => string;   // where git fetches and pushes; GitHub over SSH unless a test says
 }
-export interface Landing { repo: string; pr: number; head: string }
+export interface Landing { repo: string; pr: number; head: string; late?: () => boolean }   // late (0.19.4): his tap's 2 hours are over
 export type Landed =
-  | { ok: true; already: boolean }
-  | { ok: false; why: string; again: boolean; stopped?: boolean; at?: number };   // at (0.19.4): when to try again (GitHub's hour resets)
+  | { ok: true; already: boolean; base?: string }   // base (0.19.4): the pull request's base as the landing read it
+  // at (0.19.4): when to try again (GitHub's hour resets); budget: a wait only for GitHub's hour (not a try)
+  | { ok: false; why: string; again: boolean; stopped?: boolean; at?: number; budget?: boolean };
 
 const no = (why: string, again = false): Landed => ({ ok: false, why, again });
 const first = (s: string) => s.split(/\r?\n/).map((l) => l.trim()).find(Boolean)?.slice(0, 120) ?? "";
+import type { ApiOpts } from "./budget";
 export const remote = (repo: string) => `git@github.com:${repo}.git`;
 const where = (d: Pick<MergeDeps, "remote">, repo: string) => d.remote?.(repo) ?? remote(repo);
 
@@ -156,11 +159,11 @@ async function runsOf(d: Pick<MergeDeps, "api">, repo: string, head: string, nam
 // pages add up to that total. A page that fails, a total that shifts, a short page before the
 // total is reached, or more than RUN_PAGES pages: null, so nothing is judged on part of it.
 // "missing" only when the very first page says there's no such thing.
-async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string, key: string): Promise<any[] | "missing" | null> {
+async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string, key: string, o?: ApiOpts): Promise<any[] | "missing" | null> {
   const got: any[] = [];
   let total: number | null = null;
   for (let page = 1; page <= RUN_PAGES; page++) {
-    const r = await read(d, path(page));
+    const r = await read(d, path(page), o);
     if (r === "missing") return page === 1 ? "missing" : null;
     if (!r || !Array.isArray(r[key])) return null;
     const t = Number(r.total_count);
@@ -182,6 +185,10 @@ async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string
 //     an attempt (a job's id is its check run's id, so the two listings join by id).
 // Any listing that isn't whole, a page that fails, or more than ATTEMPT_LISTS attempt listings:
 // null, and the gate holds. trace, when given, gets every path read, for the dry run.
+// 0.19.4 (budget.ts): the workflow runs listing is read afresh every time (never kept for good), so each card and
+// landing reads every run's current run_attempt. An attempt's job list may be kept only once a read of that run
+// attempt that wasn't kept says that very attempt number is completed: the run in the listing for its newest attempt,
+// GET .../runs/{id}/attempts/{n} for an earlier one (asked only when the list isn't kept yet). Never from the job list alone.
 const ATTEMPT_LISTS = 30;
 export interface WindowsAttempt { id: number; name: string; status: string; conclusion: string | null; head_sha: string; app: { id: number }; run_id?: number; run_attempt?: number; via: string[] }
 export async function windowsAttempts(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<WindowsAttempt[] | "missing" | null> {
@@ -209,13 +216,21 @@ export async function windowsAttempts(d: Pick<MergeDeps, "api">, repo: string, h
     if (!Number.isInteger(n) || n < 1) return null;
     for (let a = 1; a <= n; a++) {
       if (++lists > ATTEMPT_LISTS) return null;
-      const jobs = await pagesOf(d, (page) => `/repos/${repo}/actions/runs/${r.id}/attempts/${a}/jobs?per_page=100&page=${page}`, "jobs");
+      let done: Promise<boolean> | null = null;
+      const confirm = () => (done ??= a === n ? Promise.resolve(r?.status === "completed" && Number(r?.run_attempt) === a)
+        : attemptDone(d, repo, Number(r.id), a));
+      const jobs = await pagesOf(d, (page) => `/repos/${repo}/actions/runs/${r.id}/attempts/${a}/jobs?per_page=100&page=${page}`, "jobs", { confirm });
       if (jobs === null || jobs === "missing") return null;
       for (const j of jobs) if (j?.name === WINDOWS_CHECK)
         add({ ...j, head_sha: j?.head_sha ?? head }, `run ${r.id} attempt ${a}`, { app: { id: ACTIONS_APP }, run_id: Number(r.id), run_attempt: a });
     }
   }
   return [...out.values()];
+}
+// (0.19.4) One run attempt read afresh: completed, as that very attempt number of that run.
+async function attemptDone(d: Pick<MergeDeps, "api">, repo: string, id: number, n: number): Promise<boolean> {
+  const r = await read(d, `/repos/${repo}/actions/runs/${id}/attempts/${n}`);
+  return !!r && r !== "missing" && r.status === "completed" && Number(r.run_attempt) === n && Number(r.id) === id;
 }
 export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
   const each = await Promise.all(CHECKS.map((name) => runsOf(d, repo, head, name)));
@@ -287,10 +302,10 @@ export function judgeChecks(runs: any[], windows = false): CheckState[] {
 // again: the link shares 60 unauthenticated reads an hour, and asking at once won't mend it.
 // It is a failed page (null), whatever its body holds: the listing isn't whole, and the landing,
 // the Ship card and the gate's report all hold on it.
-async function read(d: Pick<MergeDeps, "api">, path: string): Promise<any | "missing" | null> {
+async function read(d: Pick<MergeDeps, "api">, path: string, o?: ApiOpts): Promise<any | "missing" | null> {
   for (let i = 0; i < 2; i++) {
     try {
-      const r = await d.api(path);
+      const r = await d.api(path, o);
       if (r.status === 200 && r.body) return r.body;
       if (r.status === 404) return "missing";
       if (r.status === 403 || r.status === 429) return null;
@@ -352,6 +367,8 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
   if (pull === "missing") return no("GitHub has no such pull request");
   if (!pull) return no("GitHub didn't answer about the pull request", true);
   const merged = pull.merged === true;
+  const baseSha = String(pull.base?.sha ?? "").toLowerCase();
+  const base = SHA.test(baseSha) ? { base: baseSha } : {};
   if (!merged) {
     if (pull.state !== "open") return no("the pull request was closed");
     if (String(pull.base?.ref ?? "") !== "main") return no("it isn't a pull request into main");
@@ -366,16 +383,18 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
   const fetched = await fetchBoth(d, l, !merged);
   if (fetched) return fetched;
   // Already in main (an earlier tap landed it, or GitHub says it's merged): nothing to push.
-  if (await ancestor(d, l.head, "refs/ship/main")) return { ok: true, already: true };
+  if (await ancestor(d, l.head, "refs/ship/main")) return { ok: true, already: true, ...base };
   if (merged) return no("GitHub says it's merged, but main doesn't have that commit");
   if ((await sha(d, "refs/ship/pull")) !== l.head) return no("GitHub sent something other than the commit his card was for");
   if (!(await ancestor(d, "refs/ship/main", l.head)))
     return no("main moved on since its branch was made: the branch needs main merged in, then a new Ship card");
   if (d.stopped()) return { ok: false, why: "everything is stopped", again: false, stopped: true };
+  // (0.19.4) right before the push, his tap's 2 hours too
+  if (l.late?.()) return no("his tap is over 2 hours old, so the link didn't push it");
   const push = await d.git(["push", "--porcelain", "--no-verify", where(d, l.repo), `${l.head}:refs/heads/main`], { ssh: true, timeoutMs: 90_000 });
-  if (push.code === 0) return { ok: true, already: false };
+  if (push.code === 0) return { ok: true, already: false, ...base };
   // Did it land anyway (the answer was lost)? main says.
-  if ((await inMain(d, l.repo, l.head)) === true) return { ok: true, already: false };
+  if ((await inMain(d, l.repo, l.head)) === true) return { ok: true, already: false, ...base };
   const said = `${push.out}\n${push.err}`;
   if (/non-fast-forward|fetch first|\[rejected\]/i.test(said))
     return no("main moved on while it was landing: the branch needs main merged in, then a new Ship card");

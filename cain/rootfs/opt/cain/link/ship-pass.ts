@@ -49,7 +49,7 @@ import { createHash } from "node:crypto";
 import { publicKey, readToken, type Claim } from "../ship-token";
 import { bumpsAt, fileAt, type MergeDeps, versionAt } from "./merge";
 import { markHash, type DrillDeps, type DrillMode } from "./drill";
-import { type Budget, REG_ASKS, RESET_SLACK_MS, resetClock, shortUntil } from "./budget";
+import { type ApiOpts, type Budget, rateRefused, refusedUntil, REG_ASKS, RESET_SLACK_MS, resetClock, shortUntil } from "./budget";
 
 export const PASS_FORMAT = 2;                     // 0.1.4: entries carry their state (format 1 entries count as passed)
 export const ATTEMPT_WAIT_MS = 5 * 60_000;        // (0.1.5) one App's registration polled for this long
@@ -177,16 +177,20 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
 
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
 export interface Claimed { attempt: string; claim: string; until: string }
-export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
+// (Keeper 0.1.8) cancel: the enrollment refusal's why. (Cain 0.19.4) plain: said is the whole reason (GitHub's hour), not the keeper's
+export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string; plain?: boolean };
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
-  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number; waitUntil?: number };
+  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number; waitUntil?: number; base?: string };
+type Note = { apps?: number; attempt?: string; waitUntil?: number; base?: string };
 export interface PassDeps {
   pub: () => string | null;                      // the link's public Ship key (base64 SPKI), as /data/trust/ship.pub holds it
   now: () => number;
   load: () => string | null;                     // the pass file's text (null: none yet)
   store: (text: string) => void;                 // writes it whole; throws on failure
   // the keeper registration, in the background; note(upd) keeps how many Apps and which attempts it made
-  register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: { apps?: number; attempt?: string; waitUntil?: number }) => void) => void;
+  // (Cain 0.19.4) active: the pass is still registering and its token still good (checked after a wait and before each keeper
+  // write); expires: the pass's recorded expiry (ms)
+  register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: Note) => void, active?: () => boolean, expires?: () => number | null) => void;
   claim?: (a: Accepted, request: string) => Promise<{ status: number; body: any } | null>;   // (0.1.5) POST /attempt/<id>/claim (Keeper 0.1.7: with its request id)
   // (0.1.5) POST /attempt/<id>/cancel. Keeper 0.1.11: its answer judged when given: only a plain "ended" counts; anything else
   // (pending, refused, an error, no answer) is no success, logged, and the owner gets a card offering a retry (retry)
@@ -205,6 +209,8 @@ export type PassAnswer = { status: "ok"; pr: number; head: string; accepted: Acc
 export const PENDING_SAID = "the keeper is taking the backup before this install; nothing has run and the tap still counts: start the same Ship run again in a minute";
 // (Cain 0.19.4) The registration waits for GitHub's hour to reset (what it reads isn't left): the pass stays pending
 // meanwhile, its wait is longer by that much, and the hook's line says when to start the same run again.
+// (Cain 0.19.4) A pass left registering with a wait for GitHub's hour when the link restarted: refused with that reason.
+export const budgetRestartSaid = (until: number, tz?: string) => `the link restarted while the registration waited for GitHub's hourly allowance for the link's reads (spent until ${resetClock(until, tz)}), so the pass was refused at its start; a Ship tap on a new card can go at ${resetClock(until + 60_000, tz)} or later`;
 export const budgetPendingSaid = (until: number, tz?: string) => `GitHub's hourly allowance for the link's reads is spent until ${resetClock(until, tz)}, so the link waits and then registers the install by itself; nothing has run and the tap still counts: start the same Ship run again at ${resetClock(until + 60_000, tz)}`;
 
 function readEntries(text: string | null): Entry[] | null {
@@ -239,7 +245,7 @@ export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; b
 
 // (0.1.5) What the registration made so far, kept on its entry: the number of watched Apps (the pass's
 // wait scales with it) and each attempt id (cancelled if the pass gives up).
-export function noteEntry(d: PassDeps, id: string, upd: { apps?: number; attempt?: string; waitUntil?: number }): void {
+export function noteEntry(d: PassDeps, id: string, upd: Note): void {
   const spent = readEntries(d.load());
   const e = spent?.find((x) => x.id === id);
   if (!spent || !e) return;
@@ -247,6 +253,7 @@ export function noteEntry(d: PassDeps, id: string, upd: { apps?: number; attempt
   if (upd.apps !== undefined) e.apps = upd.apps;
   if (upd.attempt) e.attempts = [...(e.attempts ?? []), upd.attempt];
   if (upd.waitUntil !== undefined) e.waitUntil = upd.waitUntil;
+  if (upd.base !== undefined) e.base = upd.base;
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's progress"); }
 }
 
@@ -260,8 +267,9 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
     if (r.ok) cancelAll(d, r.accepted.map((a) => a.attempt), "its pass had already ended");
     return;
   }
+  running(d).delete(id);
   if (r.ok) { e.state = "accepted"; e.accepted = r.accepted; if (r.fp) e.fp = r.fp; }
-  else { e.state = "refused"; e.said = `the keeper didn't accept every install: ${r.said.join("; ").slice(0, 400) || "no reason"}`; }
+  else { e.state = "refused"; e.said = r.plain ? r.said.join("; ").slice(0, 400) : `the keeper didn't accept every install: ${r.said.join("; ").slice(0, 400) || "no reason"}`; }
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's outcome: the pass times out and is refused"); return; }
   d.log(r.ok ? `the keeper accepted every watched install for a Ship token (${r.accepted.map((a) => `${a.attempt} backup ${a.backup}`).join(", ") || "none watched"})` : `a Ship token's pass is refused: ${e.said}`);
   if (!r.ok) cancelAll(d, e.attempts ?? [], r.cancel ?? "the pass is refused");
@@ -283,7 +291,10 @@ export async function reconcilePasses(d: PassDeps): Promise<number> {
     if (e.state === "registering" || e.state === "accepted" || e.state === "claiming") {
       const ids = [...new Set([...(e.attempts ?? []), ...(e.accepted ?? []).map((a) => a.attempt)])];
       const was = e.state;
-      e.state = "refused"; e.said = "the link restarted before its Ship run started, so the pass was refused at its next start";
+      e.state = "refused";
+      // (Cain 0.19.4) one left waiting for GitHub's hour says so, with when a new tap can go
+      e.said = was === "registering" && e.waitUntil ? budgetRestartSaid(e.waitUntil, d.tz)
+        : "the link restarted before its Ship run started, so the pass was refused at its next start";
       refused++;
       d.log(`the reconcile at start refused a pass left ${was} by a restart (${ids.join(", ") || "no attempt registered yet"}): nothing was installed`);
       if (ids.length) cancelAll(d, ids, "the link restarted before its Ship run started");
@@ -321,6 +332,10 @@ export function cancelPass(d: PassDeps, token: string, why: string): PassAnswer 
   return { status: "refused", said: `${said}. Nothing was installed; start again with a new Ship card for the same pull request and head` };
 }
 
+// (Cain 0.19.4) The passes whose registration runs in this process, by its deps (a restart starts with none).
+const runningBy = new WeakMap<PassDeps, Set<string>>();
+const running = (d: PassDeps): Set<string> => { let r = runningBy.get(d); if (!r) runningBy.set(d, (r = new Set())); return r; };
+
 export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassAnswer> {
   const token = typeof body?.token === "string" ? body.token.trim() : "";
   if (!token) return { status: "refused", said: "no Ship token" };
@@ -343,7 +358,9 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
     try { writeEntries(d, spent); }
     catch { return { status: "refused", said: "the link couldn't record the Ship token, so no Ship run starts: try again in a minute" }; }
     d.log(`registering the installs of ${where} with the keeper; the Ship run waits for its acceptance`);
-    d.register(token, c.claim, (r) => settle(d, id, r), (upd) => noteEntry(d, id, upd));
+    running(d).add(id);
+    const active = () => { const x = readEntries(d.load())?.find((y) => y.id === id); return !!x && x.state === "registering" && x.exp * 1000 > d.now(); };
+    d.register(token, c.claim, (r) => settle(d, id, r), (upd) => noteEntry(d, id, upd), active, () => c.claim.exp * 1000);
     return depth ? { status: "pending", said: PENDING_SAID } : shipPass(d, body, 1);
   }
   const refuseFor = (said: string, cancel: string[], cancelWhy = "the pass is refused"): PassAnswer => {
@@ -363,6 +380,9 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   }
   if (e.state === "refused") return { status: "refused", said: `${e.said ?? "the keeper didn't accept the install"}. ${again}` };
   if (e.state === "registering") {
+    // (Cain 0.19.4) a pass left waiting for GitHub's hour by a restart (no registration runs for it here): refused with
+    // that reason, never as the keeper's wait running out
+    if (e.waitUntil && !running(d).has(id)) return refuseFor(budgetRestartSaid(e.waitUntil, d.tz), e.attempts ?? []);
     // (Cain 0.19.4) a wait for GitHub's hour to reset lengthens the pass's wait by as much
     const wait = passWaitMs(e.apps ?? 1, d.waitMs) + Math.max(0, (e.waitUntil ?? 0) + RESET_SLACK_MS - e.at);
     if (e.waitUntil && e.waitUntil + RESET_SLACK_MS > now) return { status: "pending", said: budgetPendingSaid(e.waitUntil, d.tz) };
@@ -421,11 +441,15 @@ export interface RegisterDeps {
   get?: (path: string) => Promise<{ status: number; body: any } | null>;    // (0.1.5) GET /attempt/<id>
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
-  note?: (upd: { apps?: number; attempt?: string; waitUntil?: number }) => void;
-  // (Cain 0.19.4) what is left of GitHub's hour (budget.ts, /rate_limit: not counted); the registration waits for the reset
-  // when what it reads isn't left, and once more if a read was refused for the rate limit
+  note?: (upd: Note) => void;
+  // (Cain 0.19.4) what is left of GitHub's hour (budget.ts); the registration waits for the reset, once at most, when what it
+  // reads isn't left or GitHub refused a read for its rate limit (registerInstalls)
   budget?: () => Promise<Budget | null>;
   tz?: string;
+  active?: () => boolean;                                                 // (Cain 0.19.4) the pass is still registering
+  expires?: () => number | null;                                          // (Cain 0.19.4) the pass's recorded expiry (ms)
+  landing?: () => string | null;                                          // (Cain 0.19.4) the base his tap's landing read
+  hold?: (on: boolean) => void;                                           // (Cain 0.19.4) its reads held from card builds while it runs
   linkFp?: string | null;                                                 // the link's own Ship key's fingerprint
   enrollment?: EnrollmentStore;
   pollMs?: number; waitMs?: number;
@@ -443,43 +467,87 @@ export interface RegisterDeps {
 // bumps, a version, a probe or the fingerprint file that can't be read, a keeper that refuses, or no
 // acceptance within ATTEMPT_WAIT_MS of polling: not ok, so the pass is refused.
 export async function registerInstalls(d: RegisterDeps, token: string, c: Claim): Promise<RegResult> {
+  d.hold?.(true);                                       // (Cain 0.19.4) its reads held from card builds while it runs
+  try { return await registerOnce(d, token, c); } finally { d.hold?.(false); }
+}
+async function registerOnce(d: RegisterDeps, token: string, c: Claim): Promise<RegResult> {
   const said: string[] = [];
   const accepted: Accepted[] = [];
   let ok = true;
   let cancel: string | undefined;                       // (Keeper 0.1.8) an enrollment refusal's why, for the cancel
   const say = (l: string, bad = true) => { said.push(l); if (bad) ok = false; d.log(`keeper registration: ${l}`); };
   const now = d.now ?? Date.now, sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
-  // (Cain 0.19.4) GitHub's hour first: when what this reads isn't left, wait for the reset (at most once before the reads and
-  // once after a read the rate limit refused), then go on, with no new tap. The pass stays pending meanwhile.
-  const waitBudget = async (): Promise<boolean> => {
-    const b = d.budget ? await d.budget().catch(() => null) : null;
-    const until = shortUntil(b, REG_ASKS, now());
-    if (until === null) return false;
-    d.note?.({ waitUntil: until });
-    d.log(`keeper registration: GitHub's hourly allowance for the link's reads is spent (${b!.remaining} of ${b!.limit} left), so it waits until ${resetClock(until, d.tz)} and then goes on by itself`);
-    await sleep(Math.min(until - now(), 3_600_000) + RESET_SLACK_MS);
-    return true;
+  // (Cain 0.19.4) GitHub's hour. Every GitHub read of the registration goes through one wrapper (api, below): a read GitHub
+  // refused for its rate limit (rateRefused: a 429, or a 403 with x-ratelimit-remaining 0) waits for the reset and is read
+  // once more; ordinary failures never wait. The registration waits once at most, so all its waiting is one reset at most
+  // (reads refused during that wait share it), and the same wait serves when too little is left before it starts. Before
+  // waiting, the pass's signed expiry and its recorded one must outlast the wait plus slack and the keeper's wait for one
+  // App, or it ends at once, saying when a new tap can go. After waking, and before each keeper write, the pass must still
+  // be registering. The pass stays pending meanwhile, and the hook's line says when to start the same run again.
+  const expiry = Math.min(c.exp * 1000, d.expires?.() ?? Infinity);
+  const after = (d.waitMs ?? ATTEMPT_WAIT_MS) + 60_000;
+  let waitUsed = false, waitOver = false, waiting: Promise<boolean> | null = null, stop: string | null = null;
+  const active = () => !d.active || d.active();
+  const waitFor = (until: number, left: string): Promise<boolean> => {
+    if (waiting && !waitOver) return waiting;
+    if (waitUsed) return Promise.resolve(false);
+    waitUsed = true;
+    waiting = (async () => {
+      const wake = until + RESET_SLACK_MS;
+      if (expiry < wake + after) {
+        stop = `GitHub's hourly allowance for the link's reads is spent until ${resetClock(until, d.tz)}${left}, after this Ship tap runs out at ${resetClock(expiry, d.tz)}, so nothing was registered: a Ship tap on a new card can go at ${resetClock(until + 60_000, d.tz)} or later`;
+        return false;
+      }
+      if (!active()) { stop = "the pass ended before the link waited for GitHub's hourly allowance, so nothing was registered"; return false; }
+      d.note?.({ waitUntil: until });
+      d.log(`keeper registration: GitHub's hourly allowance for the link's reads is spent${left}, so it waits until ${resetClock(until, d.tz)} and then goes on by itself`);
+      await sleep(Math.max(0, wake - now()));
+      if (!active()) { stop = "the pass ended while the link waited for GitHub's hourly allowance, so nothing was registered"; return false; }
+      return true;
+    })().finally(() => { waitOver = true; });
+    return waiting;
   };
-  await waitBudget();
-  let pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
-  if (pull?.status !== 200 && (await waitBudget())) pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
-  const base = pull?.status === 200 ? String(pull.body?.base?.sha ?? "") : "";
-  if (!/^[0-9a-f]{40}$/.test(base)) { say(`pull request ${c.pr}'s base couldn't be read, so nothing was registered`); return { ok: false, said }; }
-  let bumps = await bumpsAt(d, c.repo, base, c.head);
-  if (!bumps && (await waitBudget())) bumps = await bumpsAt(d, c.repo, base, c.head);
-  if (!bumps) { say("what the tap installs couldn't be read, so nothing was registered"); return { ok: false, said }; }
+  const api = async (path: string, o?: ApiOpts) => {
+    const r = await d.api(path, o);
+    if (!rateRefused(r as any)) return r;
+    let until = refusedUntil(r.headers, now());
+    if (until === null) { const b = d.budget ? await d.budget().catch(() => null) : null; until = b ? shortUntil(b, 1, now()) : null; }
+    if (until === null) { stop ??= "GitHub refused a read of the registration for its rate limit, and when its hour resets couldn't be read, so nothing was registered: try again with a new Ship card in an hour"; return r; }
+    if (!(await waitFor(until, ""))) return r;
+    return d.api(path, o);
+  };
+  const gh = { api };
+  const fail = (l: string): RegResult => { say(stop ?? l); return { ok: false, said, ...(stop ? { plain: true } : {}) }; };
+  // Bound to the base and head his tap's landing used (the head is the token's): the landing's base, or (no landing known
+  // here) the pull request's base read first, kept on the pass before the wait for GitHub's hour below.
+  let base = d.landing?.() ?? "";
+  if (!base) {
+    const pull = await api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
+    base = pull?.status === 200 ? String(pull.body?.base?.sha ?? "").toLowerCase() : "";
+  }
+  if (!/^[0-9a-f]{40}$/.test(base)) return fail(`pull request ${c.pr}'s base couldn't be read, so nothing was registered`);
+  d.note?.({ base });
+  const b0 = d.budget ? await d.budget().catch(() => null) : null;
+  const short = shortUntil(b0, REG_ASKS, now());
+  if (short !== null && !(await waitFor(short, ` (${b0!.remaining} of ${b0!.limit} left)`)) && stop) return fail("");
+  const bumps = await bumpsAt(gh, c.repo, base, c.head);
+  if (!bumps) return fail("what the tap installs couldn't be read, so nothing was registered");
   const watched = bumps.filter((b) => APP_SLUGS[b.app] && WATCHED.has(APP_SLUGS[b.app]));
   d.note?.({ apps: watched.length });
   if (!watched.length) return { ok: true, accepted, said };
-  const fpFile = await fileAt(d, c.repo, FINGERPRINT_FILE, c.head);
+  const fpFile = await fileAt(gh, c.repo, FINGERPRINT_FILE, c.head);
   const committed = fpFile && fpFile !== "missing" ? readFingerprintFile(fpFile.toString("utf8")) : "";
+  if (fpFile === null && stop) return fail("");
   if (!committed) { say(`${FINGERPRINT_FILE} at the head ${fpFile === null ? "couldn't be read" : "holds no fingerprint"} (the Build run when the link's Ship key is made writes it), so nothing was registered`); return { ok: false, said }; }
   if (d.linkFp && committed !== d.linkFp) { say(`${FINGERPRINT_FILE} at the head (${committed}) isn't the link's own Ship key (${d.linkFp}), so nothing was registered`); return { ok: false, said }; }
   // (Keeper 0.1.14) no registration removes a mark it doesn't own: a competing, retried or rejected one leaves an active mark be
   for (const b of watched) {
     const slug = APP_SLUGS[b.app];
-    const from = await versionAt(d, c.repo, CONFIGS[b.app], base);
-    const probe = await fileAt(d, c.repo, PROBE_FILES[b.app] ?? CONFIGS[b.app], c.head);
+    const from = await versionAt(gh, c.repo, CONFIGS[b.app], base);
+    const probe = await fileAt(gh, c.repo, PROBE_FILES[b.app] ?? CONFIGS[b.app], c.head);
+    if ((from === null || probe === null) && stop) return fail("");
+    // (Cain 0.19.4) after any wait, and before each write to the keeper: the pass must still be registering
+    if (!active()) return fail("the pass ended before the link registered the install, so nothing was registered");
     if (!from || from === "none" || !probe || probe === "missing") { say(`${b.app}'s version at the base or its probe at the head couldn't be read: not registered`); continue; }
     // (Keeper 0.1.13) the owner's drill flag, spent here, before the keeper is asked, so it counts once whatever follows:
     // while it was set this install goes as kind drill, and it fails on purpose as the flag names (drill.ts)
@@ -538,6 +606,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
           d.drill!.aborted(attempt, b.version, "its mark couldn't be written");
           say(`the drill mark for ${attempt} couldn't be written, so ${b.app} ${b.version} wouldn't fail as the drill needs: the drill is aborted, not installed`); continue;
         }
+        if (!active()) { d.drill!.drop(attempt); cancel = "the drill was aborted: its pass ended"; d.drill!.aborted(attempt, b.version, "its pass ended"); say(`the pass ended before the drill mark for ${attempt} was confirmed: the drill is aborted, not installed`); continue; }
         const conf = d.markPost ? await d.markPost(attempt, { mode: drill, to_version: b.version, mark: markHash(text) }).catch(() => null) : null;
         if (!conf || conf.status !== 200 || conf.body?.status !== "marked" || conf.body?.id !== attempt) {
           const why = !conf ? "the keeper didn't confirm its mark (no answer)" : `the keeper didn't confirm its mark (${String(conf.body?.why ?? conf.body?.status ?? conf.status).slice(0, 120)})`;

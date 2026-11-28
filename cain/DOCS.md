@@ -193,17 +193,30 @@ GitHub's hourly reads (since 0.19.4). The App reads GitHub without a key, which 
 times an hour from your home address. On Nov 27 a busy afternoon of Ship taps spent the hour and a Ship
 tap was refused with "what the tap installs couldn't be read". Now:
 
-- a file at a given commit and a finished test run are read once and kept, and an open Ship card's pull
-  request is looked at mostly through git, which doesn't count against the 60;
+- a file at a given commit is read once and kept (a "not found" never is: GitHub says that too for a
+  commit it hasn't caught up with). A test run's job list is kept only once GitHub says that very run
+  attempt has finished; the list of runs is read fresh every time, so a re-run is always seen. An open
+  Ship card's pull request is looked at mostly through git, which doesn't count against the 60, and the
+  App asks GitHub about it only while more than one tap's worth of reads is known to be left;
 - before a Ship card goes out, and when you tap Ship, the App asks GitHub how much of the hour is left
-  (that question is free). If your tap would run short, the card says until when ("a Ship tap now waits
-  until then"), and a tap waits for the reset and then lands and installs by itself: no second tap. If
-  even the card can't be read, Cain shows it again at the time it names;
+  (that question doesn't count against the 60, so it is asked only then, never in a loop). An answer
+  that fails counts as unknown, never as a full hour, and the lowest count seen in the hour stands.
+  A tap that is landing or installing keeps its share of the hour, so a card meanwhile can't spend it;
+- if a card can't be read in what is left, it goes anyway with "the pull request couldn't be read just
+  now" and a line saying the hour is low: your tap reads everything before it lands. If your tap would
+  run short, the card says until when ("a Ship tap now waits until then"), and a tap waits for the
+  reset and then lands and installs by itself: no second tap. A tap still lasts 2 hours: if GitHub's
+  hour resets after that, the card says so plainly, and when a tap on a new card can go;
+- the install's registration reads GitHub once more. If GitHub refuses a read for its hourly limit, it
+  waits once for the reset and reads again, but only if your tap lasts past it; otherwise it stops at
+  once and says when to tap again. It uses the base your tap's landing read, and a Stop or a refusal
+  while it waits ends it before anything reaches the keeper;
 - once an hour the App's log has a line "GitHub API reads in the last hour: ...", the count measured on
-  the Pi.
+  the Pi (each read counted, "not changed" answers included, and its questions about the hour counted
+  apart).
 
 A key would raise the limit to 5,000 an hour. It is not used: the App keeps to its rule that nothing
-else's credentials take part, and with these changes one Ship takes about 25 reads instead of about 39.
+else's credentials take part, and with these changes a Ship takes far fewer reads than the about 39 it took.
 If the hourly line ever shows the App near 60, the step would be one fine-grained token on your GitHub
 account, read-only, for public repositories only, put in a new App option; that needs a build first.
 

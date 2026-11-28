@@ -75,7 +75,7 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { makeGithub, RESERVE, resetClock } from "./budget";
+import { type ApiOpts, makeGithub, pullStateReader, resetClock } from "./budget";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
@@ -181,26 +181,18 @@ function readOr(path: string): string | null {
 
 // A pull request now. GitHub's API says whether it's open and its head; GitHub's own refs (git
 // ls-remote, not counted against the API's 60 asks an hour) give the head alone. 0.19.4: the API is
-// asked for one pull request at most every PULL_STATE_EVERY_MS, and never while what is left of the
-// hour is his taps' reserve (budget.ts RESERVE); the refs answer in between. Nothing it can't tell
-// takes a card off.
-const PULL_STATE_EVERY_MS = 30 * 60_000;
-const pullAsked = new Map<string, number>();
+// asked for one pull request at most every PULL_STATE_EVERY_MS (the time is kept before it is asked,
+// whatever the answer), and only while what is known to be left, less the holds of taps landing or
+// registering, is above his taps' reserve (budget.ts RESERVE): it stops at the reserve, never spends into
+// it, and an unknown hour isn't spent. The refs answer in between. Nothing it can't tell takes a card off.
 async function pullNow(pr: string): Promise<Pull | null> {
   const m = PULL.exec(pr);
   if (!m) return null;
-  const at = pullAsked.get(pr);
-  if ((at === undefined || Date.now() - at >= PULL_STATE_EVERY_MS) && gh.short(RESERVE) === null) {
-    try {
-      const r = await gh.api(`/repos/${m[1]}/${m[2]}/pulls/${m[3]}`);
-      if (r.status === 200 && r.body) {
-        pullAsked.set(pr, Date.now());
-        const j: any = r.body;
-        const head = String(j?.head?.sha ?? "");
-        return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null,
-          merged: j?.merged === true };
-      }
-    } catch { /* fall back to the refs */ }
+  const j: any = await pullState(`/repos/${m[1]}/${m[2]}/pulls/${m[3]}`);
+  if (j) {
+    const head = String(j?.head?.sha ?? "");
+    return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null,
+      merged: j?.merged === true };
   }
   try {
     const p = Bun.spawn(["git", "-c", "credential.helper=", "ls-remote", `https://github.com/${m[1]}/${m[2]}.git`, `refs/pull/${m[3]}/head`],
@@ -227,11 +219,14 @@ const deployKey = loadDeployKey(DEPLOY_KEY, (line) => console.log(`[cain] link: 
 // pinned host keys. Nothing else's config or credentials take part. 0.19.4: every API read
 // goes through budget.ts (a file at a commit kept for good, ETags, what is left of the hour).
 const gh = makeGithub();
-const githubApi = (path: string) => gh.api(path);
-// Once an hour, what the link asked of GitHub's API in the last hour, measured on the device.
+const githubApi = (path: string, o?: ApiOpts) => gh.api(path, o);
+const pullState = pullStateReader(gh);
+// Once an hour, what the link asked of GitHub's API in the last hour, measured on the device: reads sent (a 304
+// counts, since without a key GitHub counts it), reads answered from the link's kept ones, and /rate_limit calls on
+// their own (not counted against the 60, but they can count against GitHub's secondary limits: never polled in a loop).
 setInterval(() => {
   const h = gh.hour(), b = gh.seen();
-  console.log(`[cain] link: GitHub API reads in the last hour: ${h.asked} asked, ${h.kept} answered from the link's kept reads${b ? `; ${b.remaining} of ${b.limit} left until ${resetClock(b.reset, TZ)}` : ""}`);
+  console.log(`[cain] link: GitHub API reads in the last hour: ${h.asked} asked (304s included), ${h.kept} answered from the link's kept reads, ${h.limits} /rate_limit reads${b ? `; ${b.remaining} of ${b.limit} left until ${resetClock(b.reset, TZ)}` : "; what is left is unknown"}`);
 }, 3_600_000);
 const SSH = sshArgs(DEPLOY_KEY, KNOWN_HOSTS);
 const gitRun = makeGit({ repoDir: REPO_DIR, ssh: SSH.join(" "), home: DIR, timeoutBin: timeoutBin() });
@@ -272,7 +267,9 @@ const link = new Link({
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
   pull: pullNow,
   tz: TZ,
-  budget: () => gh.rateLimit(),
+  // 0.19.4: a card's view is what is left less what taps landing or registering hold; his tap's landing sees it whole
+  budget: async (view) => { const b = await gh.rateLimit(); return b && view === "card" ? { ...b, remaining: Math.max(0, b.remaining - gh.held()) } : b; },
+  hold: (key, until) => { if (until === null) gh.free(key); else gh.hold(key, until); },
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
   // Keeper 0.1.9: his tap on the rotation card, signed with the Ship key here and sent to the keeper (rotation.ts)
@@ -458,9 +455,14 @@ const shipPassDeps: PassDeps = {
   store: (text) => writeSynced(SHIP_PASSES, text),
   // Keeper 0.1.5: POST /attempt answers 202 at once and the link polls GET /attempt/<id> until accepted or
   // refused (ATTEMPT_WAIT_MS per App); the pass stays "pending" meanwhile (ship-pass.ts).
-  register: (tok, claim, done, note) => {
+  // Cain 0.19.4: bound to the base his tap's landing read, its reads held from card builds while it runs, the pass checked
+  // after any wait for GitHub's hour and before each keeper write
+  register: (tok, claim, done, note, active, expires) => {
     const pub = shipPub();
+    const key = `pass:${claim.pr}:${claim.head}`;
     void registerInstalls({ api: githubApi, budget: () => gh.rateLimit(), tz: TZ, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
+      active, expires, landing: () => link.landedBase(`https://github.com/${claim.repo}/pull/${claim.pr}`, claim.head),
+      hold: (on) => { if (on) gh.hold(key, claim.exp * 1000); else gh.free(key); },
       post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
