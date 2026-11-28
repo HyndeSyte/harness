@@ -523,8 +523,11 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # with the keeper App from it, never from main's config.yaml (Nov 27: 0.19.1 was in main but never installed,
 # so Keeper refused the next install). In the background, bounded to 60 seconds, the token fed to curl on
 # stdin and never on a command line or in a log; the file is root's, in /run/cain for this container only,
-# and holds only a checked X.Y.Z (installed-version.sh). While it runs the link waits a few seconds for it,
-# then uses the image's own build version (CAIN_BUILD_VERSION), and with neither it refuses with a reason.
+# and holds only a checked version (installed-version.sh). While it runs the link waits for it to finish, up to
+# its bound, then uses the image's own build version (CAIN_BUILD_VERSION), and with neither it refuses with a
+# reason. The running mark is set here, before the lookup and the link start, so no start can find neither.
+rm -f /run/cain/installed-version 2>/dev/null || true
+: > /run/cain/installed-version.pending 2>/dev/null || true
 ( . "$OPT/installed-version.sh" && installed_version_lookup /run/cain ) >/dev/null 2>&1 &
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
 # Since 0.19.0 it also reads the keeper App's armed state with Cain's keeper token (keeper_url,

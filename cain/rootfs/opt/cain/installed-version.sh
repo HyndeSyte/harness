@@ -10,11 +10,14 @@
 # - Every call is bounded (--connect-timeout, --max-time) and so is the whole lookup
 #   (INSTALLED_LOOKUP_LIMIT seconds, 60), so it never holds up the start or lingers.
 # - The file lives only in /run/cain (cleared at every container start), is removed first thing, is written
-#   atomically (a temp file, then a rename) and holds only a version shaped like config.yaml's (X.Y.Z).
+#   atomically (a temp file, then a rename) and holds only a checked version (one to four groups of digits
+#   separated by single dots).
 #   A missing, empty, null, HTML or otherwise malformed answer writes nothing.
-# - While it runs, <file>.pending is there, so the link waits for it a few seconds before falling back.
+# - While it runs, <file>.pending is there, so the link waits for it to finish (up to its bound) before
+#   falling back.
 
-installed_version_valid() { [[ "${1:-}" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]]; }
+# One to four groups of digits separated by single dots, no leading or trailing dot (the link's VERSION, ship-pass.ts).
+installed_version_valid() { local re='^[0-9]+(\.[0-9]+){0,3}$'; [[ "${1:-}" =~ $re ]]; }
 
 # installed_version_lookup [dir]: the token is bashio's own unexported copy, read here and never exported.
 installed_version_lookup() {

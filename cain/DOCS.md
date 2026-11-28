@@ -547,9 +547,11 @@ again a card it sent after its backup was taken; the newest card is the one to a
   in `main`. Before, a version that was merged but never installed (0.19.1 on Nov 27) made the Keeper
   refuse every later install of Cain, since the Pi was still on the one before.
 - The App reads that version from Home Assistant at each start, in the background and for at most a minute,
-  and keeps it only in `/run/cain` (cleared at every start), as a plain version number. If the Ship run comes
-  while that read is still going, the link waits for it a few seconds. If it can't be read, the link uses the
-  version the running App was built as, when that is a real version number. If neither can be read, nothing
+  and keeps it only in `/run/cain` (cleared at every start), as a plain version number: one to four groups of
+  digits separated by single dots, like 0.19.3 (anything else, such as `1..2`, `dev` or `latest`, counts as
+  unreadable). If the Ship run comes while that read is still going, the link waits for it to finish, up to
+  its own bound of about a minute. If it can't be read, the link uses the version the running App was built
+  as, when that is a plain version number too, and says so in one line of its log. If neither can be read, nothing
   is registered and the Ship run is refused with that reason; the link never guesses.
 - When the Keeper itself has refused an install, or left it unprotected, there is nothing left to cancel: the
   link doesn't ask it to cancel and posts no Try again card. You get one plain line instead, saying the Keeper

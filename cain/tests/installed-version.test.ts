@@ -1,13 +1,13 @@
 // Cain 0.19.4, its first outside review's fixes: the start's lookup of the installed version (opt/cain/installed-version.sh) keeps the
-// Supervisor's token off every command line, trace and log, is bounded, writes only a checked X.Y.Z atomically into /run/cain; the
-// link's choice (ship-pass.ts cainInstalled) waits briefly for a running lookup, then takes only a valid build version, and never a
+// Supervisor's token off every command line, trace and log, is bounded, writes only a checked version atomically into /run/cain; the
+// link's choice (ship-pass.ts cainInstalled) waits for a running lookup up to its own bound, then takes only a valid build version, and never a
 // value from an earlier start; a refused registration's one plain line (core.ts refusedCard).
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cainInstalled, INSTALLED_WAIT_MS } from "../rootfs/opt/cain/link/ship-pass";
+import { cainInstalled, INSTALLED_LOOKUP_MS, INSTALLED_WAIT_MS, installedVersion, VERSION } from "../rootfs/opt/cain/link/ship-pass";
 import { rig } from "./link-rig";
 
 const ROOT = join(import.meta.dir, "..");
@@ -50,7 +50,7 @@ describe("Cain 0.19.4: the start's lookup of the installed version", () => {
     expect((statSync(r.file).mode & 0o777).toString(8)).toBe("644");
   });
   test("a missing, empty, null, HTML or malformed answer writes nothing, and an earlier start's file never survives", () => {
-    const bad: (string | null)[] = [null, "", OK(null), OK(""), OK("dev"), OK("latest"), OK(19), OK("0.19.0\nrm -rf /"), OK("0.19.0-beta"), OK("1.2"),
+    const bad: (string | null)[] = [null, "", OK(null), OK(""), OK("dev"), OK("latest"), OK(19), OK("0.19.0\nrm -rf /"), OK("0.19.0-beta"), OK("1..2"), OK("..."), OK(".1.2"), OK("1.2."), OK("1.2.3.4.5"), OK(" 1.2"), OK("v1.2"),
       "<html><body>502 Bad Gateway</body></html>", JSON.stringify({ result: "error", message: "nope" }), JSON.stringify([{ result: "ok" }]),
       JSON.stringify({ result: "ok", data: null }), "null", "{not json"];
     for (const a of bad) {
@@ -58,6 +58,9 @@ describe("Cain 0.19.4: the start's lookup of the installed version", () => {
       expect([a, r.version]).toEqual([a, null]);
       expect(readdirSync(r.run)).toEqual([]);
     }
+  }, 60_000);
+  test("the version grammar: one to four groups of digits with single dots are written as they are", () => {
+    for (const v of ["1", "1.2", "0.19.3", "1.2.3.4", "10.200.3000"]) expect([v, lookup(OK(v), { limit: 2, pause: 1 }).version]).toEqual([v, `${v}\n`]);
   }, 60_000);
   test("the whole lookup is bounded: a Supervisor that never answers well ends it within its limit", () => {
     const r = lookup(null, { limit: 3, pause: 1 });
@@ -68,6 +71,10 @@ describe("Cain 0.19.4: the start's lookup of the installed version", () => {
   }, 20_000);
   test("the start runs it in the background, in /run/cain, with no bashio Supervisor call and nothing in /data", () => {
     expect(RUN).toContain(`( . "$OPT/installed-version.sh" && installed_version_lookup /run/cain ) >/dev/null 2>&1 &`);
+    // the running mark is set before the lookup goes to the background and before the link starts: no start finds neither
+    const mark = RUN.indexOf(": > /run/cain/installed-version.pending");
+    expect(mark).toBeGreaterThan(-1);
+    expect(mark).toBeLessThan(RUN.indexOf(`( . "$OPT/installed-version.sh"`));
     const block = RUN.slice(RUN.indexOf("# The version of Cain installed now (0.19.4)"), RUN.indexOf("# Cain's link (link/main.ts): taps"));
     expect(block).not.toContain("bashio::api.supervisor");
     expect(block).not.toContain("/data");
@@ -87,15 +94,42 @@ describe("Cain 0.19.4: the link's choice of the installed version", () => {
     expect(await cainInstalled({ read: () => "0.19.0\n", pendingSince: () => k.now(), build: "0.19.3", ...k })).toBe("0.19.0");
     expect(k.t).toBe(1_000_000);
   });
-  test("while the lookup is still running, it waits for it, a few seconds at most", async () => {
-    const k = clock(); const start = k.t;
+  test("no startup race: a lookup that answers after 20 seconds is used, not the build version", async () => {
+    const k = clock(); const start = k.t; const logs: string[] = [];
     let file: string | null = null;
-    const v = await cainInstalled({ read: () => { if (k.t - start >= 1_000) file = "0.19.0"; return file; }, pendingSince: () => start, build: "0.19.3", ...k });
+    const v = await cainInstalled({ read: () => { if (k.t - start >= 20_000) file = "0.19.0\n"; return file; }, pendingSince: () => (file ? null : start),
+      build: "0.19.3", log: (l) => logs.push(l), ...k });
     expect(v).toBe("0.19.0");
-    const k2 = clock(); const s2 = k2.t;
+    expect(k.t - start).toBeGreaterThanOrEqual(20_000);
+    expect(k.t - start).toBeLessThan(21_000);
+    expect(logs).toEqual([]);
+  });
+  test("it waits up to the lookup's own bound (about 60 seconds), no longer, then falls back with one log line", async () => {
+    expect(INSTALLED_LOOKUP_MS).toBe(60_000);
+    expect(INSTALLED_WAIT_MS).toBeGreaterThanOrEqual(INSTALLED_LOOKUP_MS);
+    expect(INSTALLED_WAIT_MS).toBeLessThanOrEqual(65_000);
+    const k = clock(); const s = k.t; const logs: string[] = [];
+    expect(await cainInstalled({ read: () => null, pendingSince: () => s, build: "0.19.3", log: (l) => logs.push(l), ...k })).toBe("0.19.3");
+    expect(k.t - s).toBeGreaterThanOrEqual(INSTALLED_LOOKUP_MS);
+    expect(k.t - s).toBeLessThanOrEqual(INSTALLED_WAIT_MS + 250);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("the Supervisor's read of Cain's installed version didn't answer");
+    expect(logs[0]).toContain("0.19.3");
+    expect(logs[0]).not.toContain("\n");
+    // a lookup that started 50 seconds before the tap is waited for only to its bound, not 60 seconds more
+    const k2 = clock(); const s2 = k2.t - 50_000;
     expect(await cainInstalled({ read: () => null, pendingSince: () => s2, build: "0.19.3", ...k2 })).toBe("0.19.3");
-    expect(k2.t - s2).toBeGreaterThanOrEqual(INSTALLED_WAIT_MS);
-    expect(k2.t - s2).toBeLessThanOrEqual(INSTALLED_WAIT_MS + 250);
+    expect(k2.t - (s2 + 50_000)).toBeLessThanOrEqual(INSTALLED_WAIT_MS - 50_000 + 250);
+    // a lookup that ended having written nothing: no wait, one line
+    const k3 = clock(); const l3: string[] = [];
+    expect(await cainInstalled({ read: () => null, pendingSince: () => null, build: "0.19.3", log: (l) => l3.push(l), ...k3 })).toBe("0.19.3");
+    expect(k3.t).toBe(1_000_000);
+    expect(l3).toHaveLength(1);
+    // no fallback, no line: the file answered, or there's no valid build version either
+    const l4: string[] = [];
+    await cainInstalled({ read: () => "0.19.0", pendingSince: () => null, build: "0.19.3", log: (l) => l4.push(l), ...clock() });
+    await cainInstalled({ read: () => null, pendingSince: () => null, build: "dev", log: (l) => l4.push(l), ...clock() });
+    expect(l4).toEqual([]);
   });
   test("no running lookup (or a mark left over from one long gone): no wait, the build version if valid, else none", async () => {
     for (const since of [null, 1_000_000 - 10 * 60_000]) {
@@ -103,12 +137,29 @@ describe("Cain 0.19.4: the link's choice of the installed version", () => {
       expect(await cainInstalled({ read: () => null, pendingSince: () => since, build: "0.19.3", ...k })).toBe("0.19.3");
       expect(k.t).toBe(1_000_000);
     }
-    for (const build of ["", "dev", "latest", " ", undefined, "0.19", "v0.19.3"]) {
+    for (const build of ["", "dev", "latest", " ", undefined, "v0.19.3", "1..2", "...", ".1", "1.", "1.2.3.4.5", "0.19.3-dev", "0.19 .3"]) {
       const k = clock();
       expect(await cainInstalled({ read: () => { throw new Error("ENOENT"); }, pendingSince: () => null, build, ...k })).toBe(null);
     }
     const k = clock();
     expect(await cainInstalled({ read: () => "<html>", pendingSince: () => { throw new Error("x"); }, build: " 0.19.3 ", ...k })).toBe("0.19.3");
+  });
+  test("the strict version grammar, for the file and the build version alike", async () => {
+    const good = ["1", "0.19", "0.19.3", "1.2.3.4", "2026.11.28.1"];
+    const bad = ["1..2", "...", "", "dev", "latest", ".", ".1", "1.", "1.2.3.4.5", "0.19.3-beta", "v1", "1,2", "1.2\n3", "١.٢"];
+    for (const v of good) expect([v, VERSION.test(v)]).toEqual([v, true]);
+    for (const v of bad) expect([v, VERSION.test(v)]).toEqual([v, false]);
+    for (const v of good) {
+      expect(await cainInstalled({ read: () => `${v}\n`, pendingSince: () => null, build: undefined, ...clock() })).toBe(v);
+      expect(await cainInstalled({ read: () => null, pendingSince: () => null, build: v, ...clock() })).toBe(v);
+      expect(await installedVersion({ installed: () => v }, "x")).toBe(v);
+    }
+    for (const v of bad) {
+      expect([v, await cainInstalled({ read: () => v, pendingSince: () => null, build: undefined, ...clock() })]).toEqual([v, null]);
+      expect([v, await cainInstalled({ read: () => null, pendingSince: () => null, build: v, ...clock() })]).toEqual([v, null]);
+      expect([v, await cainInstalled({ read: () => v, pendingSince: () => null, build: "0.19.3", ...clock() })]).toEqual([v, "0.19.3"]);
+      expect([v, await installedVersion({ installed: () => v }, "x")]).toEqual([v, null]);
+    }
   });
   test("a value from an earlier start is never used: the start's lookup clears it, so the link falls back", async () => {
     const r = lookup(null, { stale: "0.18.0\n", limit: 2, pause: 1 });

@@ -455,21 +455,25 @@ export interface RegisterDeps {
   // (core.ts refusedCard). Not for a refusal for want of space, which has its own card (noSpace).
   refused?: (attempt: string, app: string, version: string, why: string) => void;
 }
-const VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,6}$/;
-// (Cain 0.19.4) The App's installed version, read through d.installed: a plain X.Y.Z, or null.
+// (Cain 0.19.4, last round) The one version grammar, for the start's file and the build version alike: one to four groups of digits
+// separated by single dots, no leading or trailing dot. Anything else ("1..2", "...", empty, "dev", "latest") is unreadable.
+export const VERSION = /^[0-9]+(\.[0-9]+){0,3}$/;
+// (Cain 0.19.4) The App's installed version, read through d.installed: a version in that grammar, or null.
 export async function installedVersion(d: Pick<RegisterDeps, "installed">, slug: string): Promise<string | null> {
   let v: string | null = null;
   try { v = (await d.installed?.(slug)) ?? null; } catch { v = null; }
   return typeof v === "string" && VERSION.test(v.trim()) ? v.trim() : null;
 }
-// (Cain 0.19.4) The longest the link waits for the start's lookup of the installed version while it is still running, and how old its
-// running mark may be before it counts as left over (the lookup itself is bounded to 60 seconds, installed-version.sh).
-export const INSTALLED_WAIT_MS = 5_000;
-export const INSTALLED_LOOKUP_MAX_MS = 75_000;
+// (Cain 0.19.4, last round) The start's lookup of the installed version is bounded to 60 seconds from its start (installed-version.sh,
+// INSTALLED_LOOKUP_LIMIT). While it runs the link waits for it up to that bound, plus 2 seconds for its last write, never just a few
+// seconds; a running mark older than that is left over from a lookup that has ended.
+export const INSTALLED_LOOKUP_MS = 60_000;
+export const INSTALLED_WAIT_MS = INSTALLED_LOOKUP_MS + 2_000;
 export interface InstalledDeps {
   read: () => string | null;                     // /run/cain/installed-version (cleared at every start), or null
   pendingSince: () => number | null;             // when the start's lookup began (its running mark's time), or null when it isn't running
   build: string | undefined;                     // CAIN_BUILD_VERSION, the image's own version
+  log?: (line: string) => void;                  // the link's log: one line when it falls back to the build version
   now?: () => number; sleep?: (ms: number) => Promise<void>; waitMs?: number;
 }
 const readVersion = (read: () => string | null): string | null => {
@@ -479,9 +483,10 @@ const readVersion = (read: () => string | null): string | null => {
   return VERSION.test(v) ? v : null;
 };
 // (Cain 0.19.4) Cain's installed version: the Supervisor's answer the App's start wrote (/run/cain/installed-version), when present and
-// valid; while that lookup is still running (its mark is there and young), the link waits for it, at most INSTALLED_WAIT_MS; then the
-// image's own build version (CAIN_BUILD_VERSION) only if it is a valid X.Y.Z (not empty, dev or latest); else null, which refuses the
-// registration with a plain reason. The file lives only in /run/cain, which every start clears, so no earlier start's value is read.
+// valid; while that lookup is still running (its mark is there and younger than its bound), the link waits for it to finish, up to
+// INSTALLED_WAIT_MS; then the image's own build version (CAIN_BUILD_VERSION) only if it is in the version grammar, logged once in one
+// line; else null, which refuses the registration with a plain reason. The file lives only in /run/cain, which every start clears, so
+// no earlier start's value is read.
 export async function cainInstalled(o: InstalledDeps): Promise<string | null> {
   const now = o.now ?? Date.now, sleep = o.sleep ?? ((ms: number) => Bun.sleep(ms));
   const until = now() + (o.waitMs ?? INSTALLED_WAIT_MS);
@@ -490,12 +495,14 @@ export async function cainInstalled(o: InstalledDeps): Promise<string | null> {
     if (v) return v;
     let since: number | null = null;
     try { since = o.pendingSince(); } catch { since = null; }
-    const running = since !== null && Number.isFinite(since) && now() - since < INSTALLED_LOOKUP_MAX_MS;
+    const running = since !== null && Number.isFinite(since) && now() - since < INSTALLED_WAIT_MS;
     if (!running || now() >= until) break;
     await sleep(Math.min(250, Math.max(1, until - now())));
   }
   const b = (o.build ?? "").trim();
-  return VERSION.test(b) ? b : null;
+  if (!VERSION.test(b)) return null;
+  try { o.log?.(`the Supervisor's read of Cain's installed version didn't answer, so the link registers this install from the build version ${b}`); } catch { /* the log never decides */ }
+  return b;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
 // is accepted (the keeper's answer "accepted" for that App and versions, with its attempt id and backup

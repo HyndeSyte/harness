@@ -451,10 +451,11 @@ const shipPassDeps: PassDeps = {
       post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null),
-      // Cain 0.19.4: from_version is the version installed now (the Supervisor's answer at the App's start, waited for briefly while
-      // that lookup runs, else the image's own build version); never main's config.yaml
+      // Cain 0.19.4: from_version is the version installed now (the Supervisor's answer at the App's start, waited for while that
+      // lookup runs, up to its own bound of about a minute, else the image's own build version); never main's config.yaml
       installed: (slug) => slug === APP_SLUGS.Cain ? cainInstalled({ read: () => readFileSync(INSTALLED_FILE, "utf8"),
-        pendingSince: () => { try { return statSync(`${INSTALLED_FILE}.pending`).mtimeMs; } catch { return null; } }, build: process.env.CAIN_BUILD_VERSION }) : null,
+        pendingSince: () => { try { return statSync(`${INSTALLED_FILE}.pending`).mtimeMs; } catch { return null; } }, build: process.env.CAIN_BUILD_VERSION,
+        log: (l) => console.log(`[cain] link: ${l}`) }) : null,
       refused: (attempt, app, version, why) => { void link.refusedCard(attempt, app, version, why).catch((e) => console.log(`[cain] link: couldn't post the refusal line: ${String(e).slice(0, 80)}`)); } }, tok, claim)
       .then(done)
       .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));

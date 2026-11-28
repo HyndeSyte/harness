@@ -4,6 +4,7 @@
 
 - An install of Cain now starts from the version actually running on the Pi, not the newest one in main. A version that was merged but never installed no longer makes the Keeper refuse the next install.
 - If that version can't be read, the Ship run is refused with a plain reason instead of a guess.
+- Right after Cain starts, a Ship waits for that read to finish, up to about a minute, instead of a few seconds, and only a plain version number counts.
 - When the Keeper has already refused an install, you no longer get a Try again card that had nothing for you to do.
 - Instead you get one plain line saying the Keeper refused it and why, with no button.
 
