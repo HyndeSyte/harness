@@ -81,7 +81,7 @@ describe("each caller opens only its own routes", () => {
   });
 
   test("root's socket opens only what the broker needs", () => {
-    expect([...ROOT_ROUTES].sort()).toEqual(["/cards", "/check", "/decision", "/guard-hold", "/pc-notice", "/reuse", "/sent"]);   // the PC job keeper's two, the review runner's decision card and the guard's hold (0.16.0), root's
+    expect([...ROOT_ROUTES].sort()).toEqual(["/cards", "/check", "/decision", "/guard-hold", "/pc-notice", "/reuse", "/review-line", "/sent"]);   // the PC job keeper's two, the review runner's decision card (retired) and the guard's hold (0.16.0), and the runner's one line to him at the cap (0.20.0), root's
     expect(routeAllowed("root", "/card")).toBe(false);
     expect(routeAllowed("root", "/ship")).toBe(false);
   });

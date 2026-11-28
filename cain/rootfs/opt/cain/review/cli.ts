@@ -9,15 +9,18 @@
 //   spend                  this month per seat: dollars, the runner's own cap, runs, findings, useful,
 //                          $ per useful; then the round count per open change against the round cap
 //   guard                  the usage guard's reading now, in two lines (the plan, the seats and the floor)
-//   health                 the last nightly seat check
+//   health                 the last nightly seat check, and each seat's label parse rate (Cain 0.20.0)
+//   decide <change> hold "<why in one line>"
+//                          Cain's decision for a change at its cap with something serious left (Cain 0.20.0): left
+//                          in the inbox for the runner, which keeps it under the change in the rounds file and has
+//                          the link post him the one "held: <why>" line. A hold is final for that change.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readStop, stoppedWhy } from "../stop.ts";
 import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
-import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
-import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
-import { capWords, grantsFor, grantWords, readGrants } from "./grants.ts";
+import { atCap, existsReview, labelRate, loadReview, type Ledger, type Health } from "./runner.ts";
+import { DEFAULT_ROUND_CAP, admit, checkDecision, countedRounds, decideWhy, decisionOf, groupOf, lastRound, readRounds } from "./rounds.ts";
 import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
@@ -30,8 +33,6 @@ const terms = () => { try { return readFileSync(cfg.termsFile, "utf8"); } catch 
 // environment, which is Cain's: his caps and round cap would be the defaults, not the App's options.
 const settings = () => readSettings(cfg.settingsFile!);
 const roundCap = () => settings()?.round_cap ?? DEFAULT_ROUND_CAP;
-// Cain 0.18.0: the owner's grants of extra rounds (the link's file, root:cain 0640); null: can't be read.
-const grants = () => cfg.grantsFile ? readGrants(cfg.grantsFile) : null;
 
 function money(n: number) { return `$${n.toFixed(2)}`; }
 
@@ -75,7 +76,7 @@ switch (cmd) {
     // it takes the brief, and its answer is the one that counts).
     const rounds = readRounds(cfg.roundsFile!);
     if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
-    const a = admit(rounds!, b, roundCap(), grants(), cfg.tz);
+    const a = admit(rounds!, b, roundCap());
     if (!a.ok) fail(a.why, 3);
     const label = labelOf(b.label)!;
     // Round 2: the guard's log is root's (0640); a refusal here goes to the link, which decides again and
@@ -105,13 +106,8 @@ switch (cmd) {
       const what = s.state === "done" ? `${s.verdict}, ${s.findings?.length ?? 0} finding(s), ${s.model}` : s.error ? `${s.error.kind}: ${s.error.detail}. Fix: ${s.error.fix}` : "";
       out(`  ${who}: ${s.state}${what ? `, ${what}` : ""}${s.next_at ? `, next try ${s.next_at}` : ""}`);
     }
-    // Cain 0.18.0: which round of the change's cap it is, with the grants that raised the cap now.
-    if (r!.change && r!.round) {
-      const rounds = readRounds(cfg.roundsFile!);
-      const g = rounds ? grantsFor(rounds, grants(), r!.change) : [];
-      const base = r!.base_cap ?? (r!.granted?.length ? roundCap() : (r!.cap ?? roundCap()));
-      out(`  ${r!.change}: ${capWords(r!.round, base, g, cfg.tz)}${r!.round_kind === "fixes" ? " (fix-only)" : " (full)"}${rounds ? "" : " (the rounds file can't be read: grants not shown)"}`);
-    }
+    // Which round of the change's cap it is (0.20.0: the cap is the rule's, never raised).
+    if (r!.change && r!.round) out(`  ${r!.change}: round ${r!.round} of ${r!.cap ?? roundCap()}${r!.round_kind === "fixes" ? " (fix-only)" : " (full)"}`);
     break;
   }
   case "result": {
@@ -154,11 +150,10 @@ switch (cmd) {
       const u = useful[s] ?? 0;
       out(`  ${LABEL[s]}: ${money(r.usd)} / ${cap[s]}, ${r.runs} runs, ${r.findings} findings, ${u} useful, ${u ? money(r.usd / u) : "-"}`);
     }
-    // The round count per open change: one with no decision card yet and a round in the last 30 days.
+    // The round count per open change: one with a round in the last 30 days.
     const rounds = readRounds(cfg.roundsFile!);
     const capN = roundCap();
     if (!rounds) { out(`Review rounds (cap ${capN}): the rounds file can't be read`); break; }
-    const gr = grants();
     const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
     const seen = new Set<string>();
     const open: string[] = [];
@@ -169,15 +164,13 @@ switch (cmd) {
       group.forEach((k) => seen.add(k));
       const done = countedRounds(rounds, key);
       if (!done.length || done[done.length - 1].at < since) continue;
-      const d = decisionOf(rounds, key);
-      const g = grantsFor(rounds, gr, key);
-      const eff = capN + g.reduce((n, x) => n + x.rounds, 0);
-      const gw = grantWords(g, cfg.tz);
-      const atCapNow = done.length >= eff;
-      const dec = d && d.round >= done.length ? ", held at the cap" : atCapNow ? ", at the cap" : "";
-      open.push(`  ${group.join(" + ")}: ${done.length} of ${eff} round${eff === 1 ? "" : "s"}${gw ? ` (${gw})` : ""}${dec}`);
+      const atCapNow = done.length >= capN;
+      const last = lastRound(rounds, key);
+      const left = atCapNow && last.state === "answered" ? `, ${last.serious} serious left` : atCapNow && last.state === "lost" ? ", its last round lost" : "";
+      const dec = decisionOf(rounds, key);
+      open.push(`  ${group.join(" + ")}: ${done.length} of ${capN} round${capN === 1 ? "" : "s"}${atCapNow ? ", at the cap" : ""}${left}${dec ? `, held: ${dec.why}` : ""}`);
     }
-    out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}${gr ? "" : "; the grants file can't be read, so no grants count"}):`);
+    out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}):`);
     out(open.length ? open.join("\n") : "  no open changes");
     break;
   }
@@ -190,8 +183,35 @@ switch (cmd) {
     let h: Health = {};
     try { h = JSON.parse(readFileSync(cfg.healthFile, "utf8")); } catch { /* none yet */ }
     for (const s of SEATS) { const x = h[s]; out(`  ${LABEL[s]}: ${!x ? "not checked yet" : x.ok ? `ok (${x.at})` : `${x.kind}: ${x.detail}. Fix: ${x.fix}`}`); }
+    // How often each seat's findings carried a valid SERIOUS or FOLLOW-UP label (unlabelled ones
+    // count as serious), over the rounds kept.
+    out("Label parse rate (findings with a valid SERIOUS or FOLLOW-UP label):");
+    for (const s of SEATS) {
+      const rows = h.labels?.[s];
+      const r = labelRate(rows);
+      out(`  ${LABEL[s]}: ${r.rate === null ? "no findings yet" : `${Math.round(r.rate * 100)}% (${r.labelled} of ${r.total} over ${rows!.length} round${rows!.length === 1 ? "" : "s"})`}`);
+    }
+    break;
+  }
+  case "decide": {
+    if (!a1 || a2 !== "hold") fail('usage: review.sh decide <change> hold "<why in one line>"');
+    const d = checkDecision({ change: a1, choice: "hold", why: a3 ?? "" });
+    if (typeof d === "string") fail(`not kept: ${d}`, 3);
+    const v = d as Exclude<typeof d, string>;
+    // Checked here first, so Cain hears at once; the runner decides again when it takes it.
+    const rounds = readRounds(cfg.roundsFile!);
+    if (!rounds) fail("not kept: the review rounds file can't be read. Log it as a Build item.", 3);
+    const why = decideWhy(rounds!, v.change, roundCap());
+    if (why) fail(`not kept: ${why}`, 3);
+    if (!cfg.inboxDir) fail("no inbox for decisions");
+    mkdirSync(cfg.inboxDir!, { recursive: true });
+    const name = `decide-${v.change}-${Date.now()}-${process.pid}`;
+    const tmp = join(cfg.inboxDir!, `.${name}.tmp`);
+    writeFileSync(tmp, JSON.stringify(v), { mode: 0o640 });
+    renameSync(tmp, join(cfg.inboxDir!, `${name}.decision`));
+    out(`left for the runner: ${v.change} held; he hears one line from the link, "held: ${v.why}"`);
     break;
   }
   default:
-    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health");
+    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health | decide <change> hold \"<why>\"");
 }

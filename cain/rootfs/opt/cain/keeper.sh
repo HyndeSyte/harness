@@ -153,7 +153,9 @@
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
-#   keeper.sh review-grant ...         retired in 0.19.1: the link answers that grants are retired
+#   keeper.sh review-grant               retired (0.20.0, the owner's review rule): it only prints a refusal.
+#                                        Three review rounds a piece, never more; at the cap nothing serious
+#                                        left ships, anything serious left is held, and he hears one line
 #   keeper.sh drill-arm <exit-on-start|verdict-fail> <version>
 #                                        (Keeper 0.1.13) posts Dane the drill card for the Keeper App: his tap on it,
 #                                        and only his tap, arms the next install of Cain as a drill that fails on
@@ -180,6 +182,11 @@ usage() { sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 # No command prints this usage: it never hands anything over.
 if [ $# -eq 0 ] || [ "$1" = help ] || [ "$1" = --help ] || [ "$1" = -h ]; then usage; exit 2; fi
 cmd="$1"; shift
+# Retired (0.20.0): the grant of extra review rounds. Nothing is posted and the link isn't asked.
+if [ "$cmd" = review-grant ]; then
+  echo '{"status":"refused","said":"keeper.sh review-grant is retired by the owner'"'"'s review rule: three review rounds a piece, never more, and no card offers more rounds or shipping with a risk. At the cap, nothing serious left gets the normal Ship card; anything serious left is held (record why with review.sh decide <change> hold \"<why>\"), and he hears one line from the App. Ask him nothing about rounds, risk or cuts. Nothing was posted."}'
+  exit 2
+fi
 # Needs no key and no link: it runs the gate itself, the broker's as his own user (the new
 # way), the reply hook as root (the old way).
 if [ "$cmd" = selftest ]; then
@@ -198,7 +205,7 @@ if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts
 case "$cmd" in
   handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;
   fastpath) url="$harness/fastpath"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant|drill-arm) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|drill-arm) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   key-expiry|key-ack) url="$link/key-note"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
@@ -238,7 +245,7 @@ fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke="" change="" rounds=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke=""
 case "$cmd" in
   handover)
     rest=()
@@ -258,7 +265,7 @@ case "$cmd" in
     set -- ${rest[@]+"${rest[@]}"} ;;
 esac
 case "$cmd" in
-  show|ask|ship|answered|check|reply|connector|review-grant)
+  show|ask|ship|answered|check|reply|connector)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -268,10 +275,6 @@ case "$cmd" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
             --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;; --review) review="$2" ;;
           esac
-          shift 2 ;;
-        --change|--rounds)
-          [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
-          if [ "$1" = --change ]; then change="$2"; else rounds="$2"; fi
           shift 2 ;;
         *) rest+=("$1"); shift ;;
       esac
@@ -369,11 +372,6 @@ case "$cmd" in
     case "${1:-}" in exit-on-start|verdict-fail) ;; *) echo '{"status":"error","said":"drill-arm takes exit-on-start or verdict-fail, then the Cain version"}'; exit 2 ;; esac
     [[ "${2:-}" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]] || { echo '{"status":"error","said":"drill-arm takes the Cain version the drill release carries, like 0.19.1"}'; exit 2; }
     body=$(jq -nc --arg m "$1" --arg v "$2" '{mode: $m, version: $v}') ;;
-  review-grant)
-    [[ "$rounds" =~ ^[1-3]$ ]] || { echo '{"status":"error","said":"--rounds takes 1, 2 or 3"}'; exit 2; }
-    [ -n "$change" ] || { echo '{"status":"error","said":"--change takes the pull request url or the change key"}'; exit 2; }
-    body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg c "$change" --arg n "$rounds" --arg r "$reply_to" \
-      '{item: $it, change: $c, rounds: ($n | tonumber), text: $t} + (if $r == "" then {} else {reply_to: $r} end)') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac

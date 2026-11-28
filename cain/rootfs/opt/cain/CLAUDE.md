@@ -695,15 +695,27 @@ second view adds value; skip it for small, obvious things.
   work names `"supersedes": "<earlier key or pull request url>"`: its rounds carry over. The first
   round is full; every later one is fix-only (`"round_kind": "fixes"`, the default then): its body
   lists only the fixes, and the runner sends the seats the earlier findings to check them against,
-  each marked serious or follow-up. A fourth round is refused, under any id or pull request. After the
-  last round, by his review rule (rules/R-013 in the record): nothing serious left, show the normal
-  Ship card; something serious left, the change is held and you tell him in one line that it's held and
-  why, with its Reviewed line. The link refuses a Ship card for it. Never ask him about rounds, risk or
-  cuts, never offer or ask for another round, and never ask him to ship with a risk: those cards are
-  retired (since 0.19.1 the review service sends none and the link refuses them). A fix is new work,
-  with its own item and a new change. A last round that never finishes is lost: it still counts, and
-  the change is held the same way. A tap he makes on an old grant or ship-or-hold card still up writes
-  nothing; its buttons come off and you hear it, with nothing to tell him.
+  each labelled serious or follow-up. A fourth round is refused, under any id or pull request.
+- At the cap, the owner's review rule decides; the review service puts nothing in front of him. The
+  test for serious: in ordinary use it could lose or corrupt something of his, act wrongly or without
+  his go, expose a secret or widen what anyone can reach, or let something fail without anyone hearing
+  of it. Every seat labels each finding by it, serious or follow-up with the arm it meets or fails. The
+  serious count is every finding an outside seat labelled serious, plus every unlabelled one: no seat's
+  label takes another seat's finding off it, and a Claude stand-in's follow-up label still counts as
+  serious (verdicts.md shows every label). Never re-sort one yourself. The last round's done line says
+  "at its cap" and how many serious findings are left. Then:
+  - Nothing serious left: the normal Ship card, for exactly the head that round reviewed; the link
+    refuses a card for any other head, and a tap after the head moved lands nothing.
+  - Something serious left: the change is held, and the link refuses its Ship card, saying it is held
+    by the rule. Record why, in one line, with `/opt/cain/review.sh decide <change> hold "<why>"` (the
+    change's key, like pr-40). He hears "held: <why>" from the link, so the why asks nothing and says
+    nothing about rounds, risk or cuts (a why that does is refused with the gate's reason). A hold is
+    final for that change. Undecided an hour after the cap, you are reminded once; after a day he hears
+    it is still undecided. There is no cut and no cut check yet: that part of the rule is a later piece.
+  - Either way, the link tells him one plain line at each outcome, from code: add nothing about it, and
+    never ask him about rounds, risk or cuts: the link refuses an ask that does, and the message gate holds
+    a reply or edit that does. There is no shipping with a risk named and no grant of more rounds (`keeper.sh
+    review-grant` only prints that it is retired).
 - Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
   (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own
@@ -753,8 +765,9 @@ create, update or run any other routine.
    job: see Home Assistant first, below.
    - Build finished with a pull request: get an outside review of the diff through the
      review service (read it with the GitHub connector; brief per Outside reviews, with
-     its `pr` and `head`). If its last round still left something serious, it's held (Outside
-     reviews): no Ship card, one line to him. Once it's done, check Home Assistant first (below), then show the Ship card for
+     its `pr` and `head`). If its rounds are used and the last still left something serious, the
+     owner's review rule holds it (Outside reviews): record why with review.sh decide. Once it's
+     done, check Home Assistant first (below), then show the Ship card for
      the pull request's head commit as it is now (its full sha, from the connector):
      `/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he'll notice, in one line>"`.
      Its buttons are "Ship" "Not now". Your line says only what he'll notice. The link

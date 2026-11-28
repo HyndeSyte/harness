@@ -6,7 +6,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { pinSocket } from "../pinned.ts";
 import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
-import { Runner, type RunnerDeps } from "./runner.ts";
+import { Runner, type OwnerLine, type RunnerDeps } from "./runner.ts";
 import { selfCheck } from "../capfiles.ts";
 import { claudeSeat } from "./seats/claude.ts";
 import { geminiSeat } from "./seats/gemini.ts";
@@ -16,6 +16,19 @@ import { CodexLogin, handle } from "./signin.ts";
 
 const log = (m: string) => console.log(`[review] ${m}`);
 
+// The owner's one plain line at the cap (Cain 0.20.0): through the link's root socket (only root
+// can open it), which builds the words itself, posts no buttons and asks nothing, and deduplicates on the line's
+// id. The message id once the link confirms it; null otherwise (tried again next tick).
+export function linePoster(linkSock: string, log: (m: string) => void) {
+  return async (l: OwnerLine): Promise<string | null> => {
+    const res = await fetch("http://link/review-line", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
+      body: JSON.stringify(l), signal: AbortSignal.timeout(45_000) } as any);
+    const j: any = await res.json().catch(() => ({}));
+    if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
+    log(`the link didn't post the line for ${l.id}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
+    return null;
+  };
+}
 
 if (import.meta.main) {
   const env = process.env;
@@ -34,8 +47,10 @@ if (import.meta.main) {
   if (keys.anthropic) seats.claude = claudeSeat({ key: keys.anthropic, model: cfg.models.claude, selftestModel: "claude-haiku-5-5",
     version: env.ANTHROPIC_VERSION_HEADER || undefined });
 
+  // Cain 0.20.0: no card goes to the owner from the review service, only one plain line at each terminal outcome
+  // at the cap, through the link.
   const runner = new Runner(cfg, {
-    seats, log,
+    seats, log, postLine: linePoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log),
     stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });
@@ -47,6 +62,8 @@ if (import.meta.main) {
   // The install-time self-check (Cain 0.16.0, round 2, ../capfiles.ts): a file of the cap's or guard's
   // with the wrong owner or mode turns both off here (no brief is taken), with one alarm naming it.
   runner.capOff = selfCheck({ log });
+  // The lines owed to the owner, kept on disk (synced) before any post, drained at the runner's start.
+  await runner.start();
 
   // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx. On a unix socket
   // only nginx's workers and root can open (C1): a TCP port could be taken by Cain's user while
