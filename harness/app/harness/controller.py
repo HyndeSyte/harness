@@ -191,6 +191,9 @@ class Controller:
                              sleep=self.sleep, monotonic=self.monotonic,
                              budgets_ok=self._budget_ok, family_add=self.family_add,
                              calendar_change=self.calendar_change)
+        # A note of Cain's that names a drive block gets the drive blocks' card (Nov 27), read when it's used.
+        self.runner.drive_card = lambda chat, job_id=None: bool(self.family_gmail is not None
+                                                                and self.family_gmail.drive_note_card(chat, job_id))
         if self.calendar_change is not None:
             self.calendar_change.fast_check = self._still_his
             self.calendar_change.after_fast = self._newer_since
@@ -3733,6 +3736,36 @@ class Controller:
                     self.meaning_live.send_receipts()  # each new block's card, with Undo
                 if self.family_gmail is not None:
                     self.family_gmail.send_drive_receipts()   # his own appointments' drives, with Undo
+                if self.family_copy is not None and self.calendar_change is not None:
+                    self._purged_copy_cards()                  # the digest's take-it-off cards, his tap
+
+    def _purged_copy_cards(self) -> int:
+        """With the morning digest: one take-it-off card for each Family copy left because Google no longer has its
+        Gmail event (family_copy.py, round 3 of the second review). Never taken off by itself: his tap. A copy that
+        can't be read just now is asked about again at the next digest."""
+        sent = 0
+        d = effects.REGISTRY[effects.CALENDAR_CHANGE]
+        for key in self.family_copy.purged_due():
+            try:
+                change = self.calendar_change.copy_purged_change(key)
+                if change is None:
+                    continue
+                params = d.validate({"changes": [change]})
+                with self.ledger.tx() as db:
+                    job_id = self.ledger.made_job(self.config.owner_user_id, "Take a Family copy off: Google no longer "
+                                                  "has its Gmail event", kind="copy_purged", db=db)
+                job = self.ledger.job(job_id)
+                seen = self.calendar_change.preview_quiet(job, params)
+                self.runner._offer(job, d, params, {"reason": "copy_purged"},
+                                   (seen.checks if seen else []) + [
+                                       "Google no longer has the Gmail event this copies, so it waits for your tap."],
+                                   seen.lines if seen else None, seen=seen, replaced=False, keep_versions=False,
+                                   new_family=True)
+                self.family_copy.purged_carded(key)
+                sent += 1
+            except Exception as e:                  # noqa: BLE001: a card is a help, never a stopped digest
+                log.warning("a purged copy's card failed: %s", type(e).__name__)
+        return sent
 
     def _compose_digest(self, paused: bool):
         """The morning digest as composed from every input (no write: delivering it is daily.deliver's).

@@ -604,7 +604,10 @@ class GoogleCalendar:
         if any(not e.get("iCalUID") for e in events if e.get("status") != "cancelled"):
             return None                    # can't name it as the feed does: the feed's copy stands
         for e in events:
-            if e.get("status") == "cancelled" or e.get("eventType", "default") not in KEPT_TYPES:
+            if e.get("status") == "cancelled":
+                _cancelled_into(out, e)    # the read's own word that it was cancelled (family_copy.py)
+                continue
+            if e.get("eventType", "default") not in KEPT_TYPES:
                 continue
             try:
                 occ = _occurrence(e, address, me)
@@ -631,6 +634,31 @@ class GoogleCalendar:
         except (TransportError, ValueError):
             return "unknown", None
         return ("ok", found) if isinstance(found, dict) else ("unknown", None)
+
+    def look_by_id(self, address: str, uid: str) -> tuple[str, dict | None]:
+        """One event by its id, where a deletion matters (the review of Nov 27, rounds 4 and 5): "ok" and it;
+        "deleted" only on 410 Gone or the event answered as cancelled (then with it); "missing" for a 404, which
+        says nothing about a deletion and is never taken as one (callers treat it as unknown; family_copy counts it
+        per copy); "unknown" for anything else. Asked with showDeleted=true, so a deleted event comes back as
+        cancelled where Google keeps it; a 400 to that asks once more without it."""
+        url = self._events(address)
+        token, _ = self._access()
+        if url is None or token is None or not _ANY_ID_RE.fullmatch(uid):
+            return "unknown", None
+        try:
+            r = self._call(token, "GET", f"{url}/{uid}?showDeleted=true")
+            if r.status == 400:
+                r = self._call(token, "GET", f"{url}/{uid}")
+            if r.status == 410:
+                return "deleted", None
+            if r.status == 404:
+                return "missing", None
+            found = r.json() if r.status == 200 else None
+        except (TransportError, ValueError):
+            return "unknown", None
+        if not isinstance(found, dict):
+            return "unknown", None
+        return ("deleted" if found.get("status") == "cancelled" else "ok"), found
 
     def read_back(self, address: str, uid: str) -> tuple[str, dict | None]:
         """One event, read to check what was written: "ok" and it, "gone", "unknown" when this one
@@ -847,3 +875,21 @@ class GoogleCalendar:
         if r.status == 412:
             return Outcome("changed", r.status)
         return self._answer(r)
+
+
+def _cancelled_into(out: "ical.Window", e: dict) -> None:
+    """A cancelled record in a read, by the identity the feed gives it: (iCalUID, the day's original start for one
+    day of a series, else "")."""
+    uid = e.get("iCalUID")
+    if not isinstance(uid, str) or not uid:
+        return
+    instance = ""
+    if e.get("recurringEventId"):
+        original = e.get("originalStartTime") or {}
+        try:
+            when = (datetime.fromisoformat(original["dateTime"].replace("Z", "+00:00")) if original.get("dateTime")
+                    else date.fromisoformat(original["date"]))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return
+        instance = ical._key(when)
+    out.cancelled.add((uid, instance))

@@ -77,6 +77,9 @@ class Window:
     # Of those, the ones whose repeat rule ends (UNTIL or COUNT): a series that can stop, so the
     # old half of a "this and following" split (family_gmail.py).
     bounded: set = field(default_factory=set)
+    # (uid, instance) of events in the window the feed itself marks STATUS:CANCELLED: a deletion said outright,
+    # never inferred from an event left out (family_copy.py, round 3 of the second review of Nov 27).
+    cancelled: set = field(default_factory=set)
 
 
 # -- lines and properties -------------------------------------------------------
@@ -546,8 +549,15 @@ def window(text: str, *, start: datetime, end: datetime, tz: str,
         e = s + dur
         if not _overlaps(s, e, start, end, local):
             return
-        if (ev.first("STATUS") and ev.first("STATUS").value.upper() == "CANCELLED") \
-                or _declined(ev, me):
+        if ev.first("STATUS") and ev.first("STATUS").value.upper() == "CANCELLED":
+            try:                       # the feed's own word that it was cancelled (family_copy.py)
+                rid = ev.first("RECURRENCE-ID")
+                out.cancelled.add((ev.uid, _key(parse_when(rid, default)) if rid is not None
+                                   else _key(s) if ev.first("RRULE") is not None else ""))
+            except Unreadable:
+                pass
+            return
+        if _declined(ev, me):
             return
         summary = unescape(ev.first("SUMMARY").value).strip() if ev.first("SUMMARY") else ""
         summary = " ".join(summary.split())[:MAX_SUMMARY] or "(no title)"

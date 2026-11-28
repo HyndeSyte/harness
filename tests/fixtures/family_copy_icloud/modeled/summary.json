@@ -1,0 +1,46 @@
+{
+ "all_ok": true,
+ "created": {
+  "end": "2026-11-12T13:00:00-05:00",
+  "start": "2026-11-12T12:00:00-05:00"
+ },
+ "moved": {
+  "end": "2026-11-12T14:00:00-05:00",
+  "start": "2026-11-12T13:00:00-05:00"
+ },
+ "steps": [
+  {
+   "answer": "ok",
+   "ok": true,
+   "step": "create"
+  },
+  {
+   "differs": [],
+   "ok": true,
+   "step": "created read back"
+  },
+  {
+   "answer": "ok",
+   "ok": true,
+   "step": "move"
+  },
+  {
+   "differs": [],
+   "ok": true,
+   "step": "moved read back"
+  },
+  {
+   "answer": "ok",
+   "ok": true,
+   "step": "delete"
+  },
+  {
+   "answer": "gone",
+   "ok": true,
+   "step": "deleted read back"
+  }
+ ],
+ "title": "Harness check - Copy",
+ "tz": "America/New_York",
+ "uid": "hx-firstday-a645c8a5a9d26a38"
+}
