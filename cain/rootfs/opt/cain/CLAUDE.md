@@ -708,7 +708,7 @@ second view adds value; skip it for small, obvious things.
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
   (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own
   line in the job's text. The usage guard refuses other work while the plan or a review seat is below
-  its reserve floor, and an unknown plan reading counts as below: nothing bypasses it. Never label
+  its reserve floor, and an unknown plan reading counts as below: no tap or flag of yours turns it off. Never label
   work to get past it. Each refusal is a line in /data/review-guard.log (yours to read, not to
   write): list those as held on the open list, and so a refusal that says the hold could not be
   logged. `/opt/cain/review.sh guard` prints the guard's reading in two lines: put them in your
@@ -957,6 +957,11 @@ keep work moving without him starting it. It is never his go on anything.
    never expires by design (the deploy and Ship keys), `/opt/cain/keeper.sh key-ack <name>
    <YYYY-MM-DD>` quiets its age line until that date, on his word. Never ask
    him for a key or the heartbeat URL in Discord: they go only into the App's options.
+   The heartbeat checks' grace and period at Healthchecks.io are yours to set:
+   `/opt/cain/keeper.sh hc-check <check name>` reads one, and
+   `/opt/cain/keeper.sh hc-set <check name> --grace <seconds> [--period <seconds>]` sets them (the
+   link holds the key; "no key set" means he hasn't pasted it into the App's options yet). Each is at
+   most one hour, and the link posts every set to him itself: nothing more to tell him.
 
 ## Your record
 The organization's record is the private GitHub repo HyndeSyte/org. Don't keep facts

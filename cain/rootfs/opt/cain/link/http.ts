@@ -6,6 +6,7 @@ import { since } from "../stop";
 import { boundedText, type Caller, routeAllowed } from "./auth";
 import { noteKey } from "../security/main";
 import { type Link, Refusal, SAID_MAX } from "./core";
+import type { HcAnswer } from "./healthchecks";
 import type { PassAnswer } from "./ship-pass";
 
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
@@ -15,6 +16,7 @@ export interface RouteDeps {
   link: Link;
   toHarness: (path: string, body: unknown) => Promise<boolean>;
   tz?: string;
+  hc?: (b: unknown) => Promise<HcAnswer>;          // 0.17.0: keeper.sh hc-check and hc-set (healthchecks.ts)
   shipPass?: (body: any) => Promise<PassAnswer>; // (0.19.0) the hook's one Ship run per token (ship-pass.ts; async since Keeper 0.1.5: the claim)
 }
 
@@ -56,7 +58,9 @@ export function linkRoutes(d: RouteDeps) {
         case "/drill-arm": return json(await link.drillCard(b.mode, b.version));
         case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
-        case "/guard-hold": return json(link.guardHoldFor(b, caller));
+        case "/guard-hold": return json(await link.guardHoldFor(b, caller));
+        // The heartbeat checks' grace and period at Healthchecks.io (0.17.0): the link holds the key.
+        case "/hc": return json(d.hc ? await d.hc(b) : { status: "refused", said: "no key set" });
         case "/ship-pass": return json(d.shipPass ? await d.shipPass(b) : { status: "refused", said: "the link can't spend Ship tokens" });
         case "/stopped": {
           const st = link.stopped();

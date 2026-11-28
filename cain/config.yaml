@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.19.3"
+version: "0.20.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -70,6 +70,13 @@ timeout: 30
 # review_round_cap: outside review rounds a change may have (the owner's rule: 3). The runner keeps it;
 # Cain's own user can't change it. usage_reserve_percent: the usage guard's reserve floor, a share of
 # the week's plan allowance and of each review seat's monthly cap that "other" work may not spend.
+# plan_weekly_allowance_tokens (0.17.0): the week's share of the Claude plan this device uses, in tokens,
+# set by hand by the owner (DOCS.md, "Usage guard", says how to re-derive it); 0 means not set, and the
+# plan's reading is unknown. The runner keeps it, like the floor. plan_allowance_set_on and
+# plan_allowance_derivation (0.17.0): the date the allowance was set and how it was worked out, in the
+# owner's words; the runner writes both beside it, and review.sh guard prints them.
+# healthchecks_api_key (0.17.0): a Healthchecks.io management API key (read-write), for keeper.sh hc-check
+# and hc-set. Only the link's process has it; Cain's user never reads it. Empty: "no key set".
 # keeper_url, keeper_token (0.19.0): the keeper App (keeper/ in this repo) on Home Assistant's internal
 # network, and Cain's own token there (the same token as the keeper's tokens entry for this App, at
 # least 16 characters). The probe gives the keeper its verdict on an install of Cain with it, and the
@@ -91,12 +98,16 @@ options:
   codex_monthly_runs: 200
   review_round_cap: 3
   usage_reserve_percent: 25
+  plan_weekly_allowance_tokens: 4200000000
+  plan_allowance_set_on: "2026-11-21"
+  plan_allowance_derivation: "35 percent of the week used on the usage page against about 1.47 billion tokens since Sunday on this device"
   owner_user_id: ""
   notice_hook: ""
   pc_jobs_token: ""
   pc_jobs_repo: "HyndeSyte/pc-jobs"
   heartbeat_url: ""
   probe_heartbeat_url: ""
+  healthchecks_api_key: ""
   keeper_url: "http://0fcc2575-keeper:8097"
   keeper_token: ""
   keeper_accept_min: 5
@@ -112,12 +123,16 @@ schema:
   codex_monthly_runs: int(0,5000)
   review_round_cap: int(1,10)
   usage_reserve_percent: int(0,90)
+  plan_weekly_allowance_tokens: int(0,1000000000000)
+  plan_allowance_set_on: match(^(\d{4}-\d{2}-\d{2})?$)?
+  plan_allowance_derivation: str?
   owner_user_id: match(^([0-9a-f]{32})?$)?
   notice_hook: password?
   pc_jobs_token: password?
   pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?
   heartbeat_url: password?
   probe_heartbeat_url: password?
+  healthchecks_api_key: password?
   keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?
   keeper_token: password?
   keeper_accept_min: int(1,15)?

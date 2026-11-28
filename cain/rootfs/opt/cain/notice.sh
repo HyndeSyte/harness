@@ -47,7 +47,19 @@
 # guard has the wrong owner or mode at a start, so the review runner and the link keep both off; capfiles.ts).
 # Since its third round, "decisions" (kind "review-decisions": the link's file of his answers at the review cap
 # didn't parse and was moved aside; cleared once the copy is gone) and "holds" (kind "review-holds": the usage
-# guard's hold route hit its cap; cleared after an hour without another).
+# guard's hold route hit its cap; cleared after an hour without another). Since 0.17.0, "decision" (kind
+# "review-decision": a decision's stored answer isn't one of its card's options; cleared once none is) and
+# "holdlog" (kind "review-holdlog": the usage guard's log couldn't be read, so a hold line may be missing;
+# cleared once it reads again). Since 0.17.0's second round of review fixes, "resetmark" (kind "review-resetmark":
+# the decisions file's reset mark can't be read, so decisions are paused; cleared once it reads again or is gone),
+# "resetwrite" (kind "review-resetwrite": the reset mark couldn't be written, so a decisions file that didn't parse
+# wasn't moved aside; cleared once the file reads or was moved aside), "plancache" (kind "review-plancache": the plan
+# reader's cache couldn't be written, or the trust check refused it; at most hourly; cleared after a good write) and
+# "planshrink" (kind "review-planshrink": the week's token count fell below its high-water mark; cleared by the next
+# complete reading that doesn't). Since its third round, "planread" (kind "review-planread": the plan reader keeps
+# failing, two readings in a row or half an hour without a complete one; at most hourly; cleared by the next complete
+# reading) and "hcset" (kind "hc-announce": a Healthchecks.io set went through but its line to him couldn't be
+# posted; at most hourly per check; cleared by the next set line that is posted).
 # Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
@@ -127,6 +139,14 @@ group_of() {
     review-files) echo review ;;
     review-decisions) echo decisions ;;
     review-holds) echo holds ;;
+    review-decision) echo decision ;;
+    review-holdlog) echo holdlog ;;
+    review-resetmark) echo resetmark ;;
+    review-resetwrite) echo resetwrite ;;
+    review-plancache) echo plancache ;;
+    review-planshrink) echo planshrink ;;
+    review-planread) echo planread ;;
+    hc-announce) echo hcset ;;
     self-off) echo watchdog ;;
     self-refused|self-loops) echo selfrestart ;;
     nginx) echo panel ;;
@@ -221,6 +241,22 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain's file of your answers on review-cap decision cards didn't parse, so the App moved it aside, never deleting it${c}. While that moved-aside copy stands, no new answer on such a card is kept and Ship cards for changes at the cap stay refused; the App doesn't set this file up again by itself. The step that turns answers back on: as root on the Pi, remove the moved-aside copy named above, or rename it so its name no longer starts with review-decisions.json.corrupt-. Answers are kept again as soon as it is gone, and the link's next sweep clears this. Cain files it for a fix. $DETAILS" ;;
     review-holds) T="Cain's usage-guard holds hit their limit"
       M="Cain's usage guard hold route hit its limit${c}. Every held build is still refused; past the limit a hold isn't logged until the next minute, and a full log is rotated keeping one previous file. The App clears this after an hour without another. Cain files it for a fix. $DETAILS" ;;
+    review-decision) T="A review-cap decision of yours can't be read"
+      M="A saved answer on one of your review-cap decision cards isn't one of that card's two choices${c}, so the App treats it as unreadable: nothing was passed on, no hold was written, its card says so, and Ship cards for that change stay refused. The way back: as root on the Pi, take that decision's entry out of /data/link/review-decisions.json (the card can then be answered again), or move the whole file aside. This clears once no saved answer is out of place. Cain files it for a fix. $DETAILS" ;;
+    review-holdlog) T="Cain's usage-guard log can't be read"
+      M="Cain's usage-guard log couldn't be read${c}, so the App can't tell whether a hold line was already written, and one may be missing: Cain lists holds from it. Nothing more is written to it on a guess. This clears once the log reads again. Cain files it for a fix. $DETAILS" ;;
+    review-resetmark) T="Your review-cap answers are paused"
+      M="The reset mark of Cain's file of your review-cap answers can't be read${c}, and the App couldn't write it again by itself, so no answer on a review-cap decision card is kept and Ship cards for changes at the cap stay refused. The way back: as root on the Pi, run bun /opt/cain/link/cap.ts reset-mark, which writes the mark again whole with the current time. Never remove the mark file: cards from before the reset would count again. This clears once the mark reads again. Cain files it for a fix. $DETAILS" ;;
+    review-resetwrite) T="Your review-cap answers can't be reset"
+      M="Cain's file of your review-cap answers didn't parse, and its reset mark couldn't be written${c}, so the App did not move the file aside: no answer on a review-cap decision card is kept until it can. The way back: as root on the Pi, check the disk has room and /data/link is writable; the next tap tries again. This clears once the file reads or was moved aside. Cain files it for a fix. $DETAILS" ;;
+    review-plancache) T="Cain's usage guard can't keep its plan count"
+      M="Cain's plan reader couldn't keep its count${c}. Until it can, each reading starts cold, and Cain's Build jobs labelled other may be held as not ready. Core, commitment and necessary-fix work still runs. The way back: as root on the Pi, check the disk has room and that /data/review-plan-cache.json is a plain file owned by root, group cain, mode 0640 (remove it and the App writes it again). This clears after the next good write. Cain files it for a fix. $DETAILS" ;;
+    review-planread) T="Cain's plan reader keeps failing"
+      M="Cain's plan reader keeps failing${c}, so the plan's reading stays unknown and his work labelled other is held. Core, commitment and necessary-fix work still runs. The App keeps trying by itself. If it lasts, check the App's log for the reader's error and that the disk has room. This clears with the next complete reading. Cain files it for a fix. $DETAILS" ;;
+    hc-announce) T="A Healthchecks.io change wasn't posted to you"
+      M="Cain changed a Healthchecks.io check's timing, and Healthchecks.io took it, but the App couldn't post you its line about it${c}. The change stands: the App log and its Healthchecks log have it. This clears once a later change's line is posted. Cain files it for a fix. $DETAILS" ;;
+    review-planshrink) T="Cain's plan count went down"
+      M="Cain's count of this week's plan use went down${c}, which only happens when a transcript of his was deleted, cut short or re-timed. Until the count is back at its mark, the plan's reading is unknown, so his work labelled other is held. Core, commitment and necessary-fix work still runs. Look at what changed in /data/cain/.claude/projects. This clears with the next reading that isn't below the mark, or when the week turns on Sunday. Cain files it for a fix. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -244,6 +280,14 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
     review) CT="Cain's review safeguards are back on"; CM="Cain's review-round cap and usage guard are on again, and Ship decisions resume: their files are the App's alone." ;;
     decisions) CT="Cain's review-cap answers are kept again"; CM="The moved-aside copy of Cain's file of your review-cap answers is gone, so new answers are kept again." ;;
+    decision) CT="Your review-cap answers read right again"; CM="Every saved answer on your review-cap decision cards is one of its card's choices again." ;;
+    holdlog) CT="Cain's usage-guard log reads again"; CM="Cain's usage-guard log can be read again, so holds are checked and written as before." ;;
+    resetmark) CT="Your review-cap answers are kept again"; CM="The reset mark of Cain's file of your review-cap answers reads again, or is gone, so answers are kept again." ;;
+    resetwrite) CT="Your review-cap answers file is settled"; CM="Cain's file of your review-cap answers reads again, or was moved aside with its reset mark." ;;
+    plancache) CT="Cain's plan count is kept again"; CM="Cain's plan reader wrote its count again, so readings go on from it." ;;
+    planshrink) CT="Cain's plan count is back"; CM="Cain's count of this week's plan use is no longer below its mark." ;;
+    planread) CT="Cain's plan reader works again"; CM="Cain's plan reader gave a complete reading again." ;;
+    hcset) CT="Healthchecks.io changes are posted again"; CM="The App posted you its line about a Healthchecks.io change again." ;;
     holds) CT="Cain's usage-guard holds are back under their limit"; CM="Cain's usage guard hold route stayed under its limit for an hour." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }

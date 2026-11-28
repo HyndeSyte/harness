@@ -83,14 +83,21 @@ import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
+import { HcAnnounceAlarm, hcCall, takeKey } from "./healthchecks";
+import { PlanRefresher } from "../plan-read";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { appendCapped, asideOf, CapAlarms, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply,
+  markHoldWritten, readReset, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
-import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
-import { guard, paths as guardPaths } from "../guard";
+import { clearAlarmDetached, raiseAlarmDetached, selfCheck } from "../capfiles";
+import { guard, paths as guardPaths, PlanCacheAlarm } from "../guard";
 import { gatewayHealthy, writeGatewayMark } from "./health-gate";
 import { KEEPER_URL, keeperCall, probeHash } from "../probe/keeper";
 import { check, CHECK_MS, every, fileStore as watchFileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
+
+// 0.17.0: the Healthchecks.io management key, from the App's option healthchecks_api_key, in this
+// process alone. Round 2: read from its root-only file, never the environment (healthchecks.ts takeKey).
+const HC_KEY = takeKey();
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
 // their old places only for the old way of starting, before the first cutover).
@@ -231,19 +238,40 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 // ../capfiles.ts): one wrong turns those features off here, with one alarm naming it. Round 3: run
 // again at each sweep, so they come back without a restart once the file is right, and the alarm clears.
 const capLog = (m: string) => console.log(`[cain] link: ${m}`);
-let capOff: string | null = selfCheck({ log: capLog });
-// Round 3: a tap's temp file left by a link that died mid-write is swept at the start.
+// Round 3 of 0.17.0's review fixes: every alarm the link raises or clears starts notice.sh detached, with
+// its own timeout, and never waits for it on this event loop (../capfiles.ts raiseAlarmDetached), so a tap
+// is answered while a notice runs its 40 seconds.
+const raiseAlarm = (cause: string, log: (m: string) => void, kind: string) => raiseAlarmDetached(cause, log, kind);
+const clearAlarm = (log: (m: string) => void, group: string) => clearAlarmDetached(log, group);
+const selfAlarm = { alarm: (c: string) => raiseAlarm(c, capLog, "review-files"), clear: () => clearAlarm(capLog, "review") };
+let capOff: string | null = selfCheck({ log: capLog, ...selfAlarm });
+// Round 3: a tap's temp file left by a link that died mid-write is swept at the start (and, since 0.17.0's
+// third round of review fixes, at each sweep, the reset mark's temp names included, never a live write's).
 sweepTemps(DECIDED, capLog);
 // Round 3: the alarm for his decisions file moved aside names the copy and the step back; it's raised
 // while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
 let asideUp: boolean | null = null;
 const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisions"); asideUp = true; };
+// 0.17.0: the stored answers, the guard's log and (round 2) the reset mark's alarms, kept by cap.ts CapAlarms.
+const capAlarms = new CapAlarms({ decided: DECIDED, guardLog: GUARD_LOG, log: capLog,
+  raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
 const capSweep = () => {
-  capOff = selfCheck({ log: capLog, prev: capOff });
+  capOff = selfCheck({ log: capLog, prev: capOff, ...selfAlarm });
+  sweepTemps(DECIDED, capLog);
   const a = asideOf(DECIDED);
   if (a.length && asideUp !== true) asideAlarm(a[0]);
   else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
+  capAlarms.sweep();
 };
+
+// The plan reading (0.17.0, round 2): in a child process with a time budget (../plan-read.ts), never on
+// this event loop, so a tap is answered while a cold read runs. Its cache alarm (guard.ts PlanCacheAlarm)
+// hears each reading. The first reading starts now, which warms the cache too.
+// Round 3: its alarms start notice.sh detached (never awaited here), and it hears every reading asked, so
+// a reader that keeps failing raises its own alarm.
+const planAlarm = new PlanCacheAlarm({ log: capLog, raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
+const plan = new PlanRefresher({ tz: process.env.CHECKIN_TZ ?? "America/New_York", log: capLog, onReading: (p) => planAlarm.saw(p), onAsk: () => planAlarm.asked() });
+void plan.read().catch(() => {});
 
 // Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
 // the spent nonces in /data/link (0700), outside Cain's backups (config.yaml backup_exclude).
@@ -296,7 +324,10 @@ const link = new Link({
   // 0.19.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
   armed: () => keeperArmedText(keeperReplies, Date.now(), PROBE_HASH),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
-  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
+  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm, onMarkFailed: (why) => capAlarms.markFailed(why) }),
+  // 0.17.0: the hold-written flag on his decision's record, and the reset mark (paused while a copy stands).
+  holdWritten: (id) => markHoldWritten(DECIDED, id),
+  decisionsReset: () => asideOf(DECIDED).length ? NaN : readReset(DECIDED),
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
   // 0.18.0: the owner's grants of extra review rounds (/data/review-grants.json, root:cain 0640), written
@@ -306,7 +337,14 @@ const link = new Link({
   capOff: () => capOff,
   // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
   // rotated root-side, keeping one previous file: cap.ts appendCapped).
-  guardHold: (label, what) => { const p = guardPaths(); return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date() }); },
+  // Round 2 of 0.17.0's review fixes: the plan is read off this event loop, within its budget (not ready: held).
+  guardHold: async (label, what) => {
+    const reading = label === "other" ? await plan.read() : null;
+    const p = guardPaths();
+    return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date(), ...(reading ? { plan: () => reading } : {}) });
+  },
+  // Round 3: a hook-requested hold line only when this refresher reports the same not-ready state now.
+  planNotReady: () => plan.notReadyNow(),
   holdLog: (line) => appendCapped(GUARD_LOG, line),
   hasHold: (tag, what) => holdLogged(GUARD_LOG, tag, what),
   alarm: (kind, cause) => raiseAlarm(cause, capLog, kind),
@@ -432,6 +470,14 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 
 // The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
 // exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
+const hcAlarm = new HcAnnounceAlarm({ raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
+const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ,
+  // Round 2: every set the service takes is relayed to Cain and posted to his DM, one plain line.
+  hc: (b: unknown) => hcCall(b, { key: () => HC_KEY, log: (l) => console.log(`[cain] link: ${l}`),
+    announce: async (line) => { link.relayLine(`${line} Nothing to tell him: the link posted it to him.`); await link.notice(line, NOTICE_TIMEOUT_MS); },
+    // Round 3: a set line that couldn't be posted raises its own alarm (at most hourly per check).
+    announceFailed: (name, why) => hcAlarm.failed(name, why), announced: () => hcAlarm.posted() }),
+  shipPass: (b: any) => shipPass(shipPassDeps, b) };
 // The Ship pass (0.19.0, with Keeper 0.1.3): one Ship run per token, and its installs registered with the
 // keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
 const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
@@ -468,7 +514,6 @@ const shipPassDeps: PassDeps = {
 };
 // Keeper 0.1.15 items 3 and 6: a pass a crash or restart left open is refused and its attempts cancelled; a passed one is read
 void reconcilePasses(shipPassDeps).catch((e) => console.log(`[cain] link: the reconcile at start failed: ${String(e).slice(0, 80)}`));
-const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ, shipPass: (b: any) => shipPass(shipPassDeps, b) };
 const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept
