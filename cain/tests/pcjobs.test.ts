@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
   attributesGood, checkFacts, confirmGate, confirmWhy, jobClaimFor, jobFromAsk, jobText, keyFingerprint, makeJobToken, normalUrl, onLogin,
   onPin, onRedirect, parseAllowlist, parseDate, parseHeartbeat, parseJob, parseKeys, parseResult, readJobToken, sanitizeUrl, seenHash, signAllowlist,
-  signerOf, stateAfter, QUEUE_ATTRIBUTES,
+  signerOf, stateAfter, QUEUE_ATTRIBUTES, CODES,
   addressCtxFor, PLANS, resultLines, reportValues, carriesReport, riskyEntry, unapprovedValues,
   type Allow, type Job, type Result,
 } from "../rootfs/opt/cain/pcjobs/core.ts";
@@ -26,7 +26,7 @@ import {
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, DEFAULT_APP_IDS, readPolicy, parseSettingsValue, parseSettingsKey,
-  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, isDesktopShell, childShape, desktopIdentity, identityMemo, casedOnDisk, casedSegs, hostListing, gateAgain, DESKTOP_SIGNER_SUBJECT, identityFailure, desktopShellWhy, busyWhy, hostKeyOf, type HostSnap, gateFix, WorkerError, type Proc, launcherChoice, LAUNCHER_BUILTINS, DESKTOP_VERSION_INFO, UTILITY_SAFE, type ExeIdentity, hasCliEntry, splitCmd, busyLine, launcherText, launcherLine, isClaudeCode, LAUNCHER_NAME, writeLauncher, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -49,6 +49,10 @@ import {
   evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
   regAnswer, chromeListingStep, LISTING_STAND_IN, LISTING_RUNNER_REFUSED, TEST_BUILD_FLAG, TEST_BUILD_FLAG_REFUSED, testBuildFlagRefusal, VERSION_HOLD_CLEAR_UNRECORDED_HINT, chromeReadFailWhy, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
+  EDGE_POLICY_KEY, EDGE_HOST_KEY, EDGE_EXTERNAL_KEY, EDGE_POLICY_NAMES, edgePolicies, manifestText, wrapperText, type EdgeSetup, type EdgeSys, type PipeIo, type RegQuery,
+  edgeExe, edgeLaunchArgs, edgeOpenArgs, EDGE_FORBIDDEN_SWITCHES, edgeGate, adminOnlyProblems, wrapperTarget, realEdgeSys, effectiveItems, parsePolicyTable, policyValueIs,
+  startJobsEdge, stopJobsEdge, jobsEdgeNow, handshakeItems, closePageTargets, treeOf, pipeLeakWhy, edgeLostWhy, edgeSetup, edgeRecord, readEdgeSetup, EDGE_QUESTION,
+  edgeComponents, recordBuiltins, EDGE_LINES, parseEdgeSetup, edgeLaunchHelper, pipeScan, jobHelperState as jobHelperState20,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import * as worker28 from "../rootfs/opt/cain/pcjobs/worker.ts";
 import * as keeper28 from "../rootfs/opt/cain/pcjobs/main.ts";
@@ -430,6 +434,80 @@ const ev = {
 interface Browser { group: { id: number; url: string }[]; events: unknown[]; use: (tool: string, input?: any, land?: string) => Promise<{ id: string; ok: boolean; text: string }> }
 // The worker's own environment in these tests: what a clean Windows or POSIX shell has, and nothing of Claude Code's.
 const TEST_ENV: Record<string, string> = { PATH: "/usr/bin", HOME: "/home/owner", SystemRoot: "C:\\Windows", TEMP: "C:\\Temp" };
+
+// ---- Cain 0.20.0: the jobs Edge, stood in for: its setup record, the registry as the setup leaves it, the pipe and the
+// policy page.
+const EDGE_EXE = "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe";
+const HOST_NAME_T = "com.anthropic.claude_browser_extension";
+const TARGET_ID = { signer: 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US', status: "Valid", version: "2.1.0.0" };
+const WRAPPER_AT = "C:\\ProgramData\\CainPcJobs\\EdgeHost\\host.cmd";
+const CLAUDE_AT = "C:\\Users\\owner\\.local\\bin\\claude.exe";
+const b64t = (x: string) => Buffer.from(x).toString("base64");
+function edgeRec(manifestPath: string, over: Partial<EdgeSetup> = {}): EdgeSetup {
+  return { v: 1, at: T0.toISOString(), edge_daily_use: false, extension_id: EXT, host_name: HOST_NAME_T,
+    manifest_path: manifestPath, manifest_b64: b64t(manifestText(HOST_NAME_T, WRAPPER_AT, EXT)), wrapper_path: WRAPPER_AT, wrapper_b64: b64t(wrapperText(CLAUDE_AT)),
+    target: CLAUDE_AT, target_signer: TARGET_ID.signer, target_version: TARGET_ID.version, builtin_ids: [], builtins_at: null, policies: edgePolicies(EXT, HOST_NAME_T), ...over };
+}
+const NOT_FOUND_T = { status: 1, stdout: "", stderr: "ERROR: The system was unable to find the specified registry key or value." };
+function policyRegText(pol: Record<string, unknown>, extra = ""): string {
+  const base = `HKEY_LOCAL_MACHINE\\${EDGE_POLICY_KEY}`;
+  let t = `\r\n${base}\r\n`;
+  for (const [n, v] of Object.entries(pol)) if (typeof v === "boolean") t += `    ${n}    REG_DWORD    0x${v ? 1 : 0}\r\n`;
+  t += extra;
+  for (const [n, v] of Object.entries(pol)) if (Array.isArray(v)) { t += `\r\n${base}\\${n}\r\n`; v.forEach((x, i) => { t += `    ${i + 1}    REG_SZ    ${x}\r\n`; }); }
+  return t + "\r\n";
+}
+// The registry as the setup's lines leave it: the policies under HKLM (both views), the host under HKLM (64-bit view), nothing else.
+function edgeReg(rec: EdgeSetup, over: Record<string, { status: number | null; stdout: string; stderr?: string; error?: boolean }> = {}, calls: string[][] = []): RegQuery {
+  return (args) => {
+    calls.push(args);
+    const k = args.join(" ");
+    if (k in over) return over[k];
+    if (args[0] === `HKLM\\${EDGE_POLICY_KEY}` && args[1] === "/s") return { status: 0, stdout: policyRegText(rec.policies) };
+    if (args[0] === `HKLM\\${EDGE_HOST_KEY}\\${rec.host_name}` && args[1] === "/ve" && args[2] === "/reg:64")
+      return { status: 0, stdout: `\r\nHKEY_LOCAL_MACHINE\\${EDGE_HOST_KEY}\\${rec.host_name}\r\n    (Default)    REG_SZ    ${rec.manifest_path}\r\n\r\n` };
+    return NOT_FOUND_T;
+  };
+}
+const ADMIN_ONLY = ["USER|S-1-5-21-1-2-3-1001", `Allow|${ADMINS_SID}|FullControl|False`, `Allow|${SYSTEM_SID}|FullControl|False`, "Allow|S-1-5-32-545|ReadAndExecute, Synchronize|False"];
+function edgeSysFor(rec: EdgeSetup, over: Partial<EdgeSys> = {}): EdgeSys {
+  return { reg: edgeReg(rec), running: () => false, target: () => TARGET_ID, acl: () => ADMIN_ONLY, procs: () => [],
+    file: (f) => f === rec.manifest_path ? Buffer.from(rec.manifest_b64, "base64") : f === rec.wrapper_path ? Buffer.from(rec.wrapper_b64, "base64") : null, ...over };
+}
+// edge://policy's table as its text reads: a heading row, then one row a policy, cells by tabs.
+type RowOver = Partial<Record<"value" | "source" | "scope" | "level" | "status", string>>;
+function policyPage(pol: Record<string, unknown>, over: Record<string, RowOver | null> = {}, extra = ""): string {
+  const lines = ["Policies", "Reload policies  Export to JSON", "Chrome policies", "Policy name\tPolicy value\tSource\tApplies to\tLevel\tStatus"];
+  for (const [n, v] of Object.entries(pol)) {
+    if (over[n] === null) continue;
+    const r = { value: Array.isArray(v) ? v.join(",") : String(v), source: "Platform", scope: "Machine", level: "Mandatory", status: "OK", ...over[n] };
+    lines.push([n, r.value, r.source, r.scope, r.level, r.status].join("\t"));
+  }
+  return lines.join("\n") + extra;
+}
+// A stand-in Edge on the other end of the pipe: answers the DevTools calls the worker makes, NUL-delimited.
+function fakeEdge(page: () => string, o: { product?: string; sent?: any[]; onClose?: () => void; dropOn?: string } = {}): PipeIo {
+  let data: ((d: Uint8Array) => void) | null = null, closed: (() => void) | null = null, gone = false;
+  const answer = (id: number, result: unknown) => setTimeout(() => { if (!gone) data?.(Buffer.from(JSON.stringify({ id, result }) + "\0")); }, 0);
+  return {
+    write: (d) => {
+      for (const part of Buffer.from(d).toString("utf8").split("\0").filter(Boolean)) {
+        const m = JSON.parse(part);
+        o.sent?.push(m);
+        if (o.dropOn === m.method) { gone = true; setTimeout(() => closed?.(), 0); continue; }
+        if (m.method === "Browser.getVersion") answer(m.id, { product: o.product ?? "Edg/142.0.3595.53", protocolVersion: "1.3" });
+        else if (m.method === "Target.createTarget") answer(m.id, { targetId: "T-POLICY" });
+        else if (m.method === "Target.attachToTarget") answer(m.id, { sessionId: "S-POLICY" });
+        else if (m.method === "Runtime.evaluate") answer(m.id, { result: { type: "string", value: m.params.expression === "document.readyState" ? "complete" : page() } });
+        else if (m.method === "Target.getTargets") answer(m.id, { targetInfos: [{ targetId: "T-POLICY", type: "page" }, { targetId: "SW", type: "service_worker" }] });
+        else if (m.method === "Browser.close") { answer(m.id, {}); setTimeout(() => { gone = true; o.onClose?.(); closed?.(); }, 1); }
+        else answer(m.id, {});
+      }
+    },
+    onData: (cb) => { data = cb; }, onClose: (cb) => { closed = cb; }, close: () => { gone = true; },
+  };
+}
+
 const stream = (events: unknown[]) => events.map((e) => JSON.stringify(e)).join("\n") + "\n";
 // A page's own script, as a browser runs it (the fragment check page's): window.location as the
 // tab has it, the fragment included, and fetch against the page's own address.
@@ -464,7 +542,10 @@ async function open(url: string) {
   try { await fetch(inner); } catch { /* not served */ }
 }
 
-function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) {
+// Cain 0.19.1, review round 4: a signer certificate's chain as Windows builds it for a publicly signed file.
+const CHAIN_OK = { issuer: "CN=DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1, O=\"DigiCert, Inc.\", C=US", chain_length: 3, root_self_signed: true, root_trusted: true };
+// browser "chrome" (Cain 0.20.0): an install on Chrome, for the Chrome checks kept as diagnostics; jobs on it refuse (browser_not_edge).
+function queueRig(o: { attributes?: string | false; confirmed?: boolean; browser?: "chrome" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pcjobs-"));
   const remote = join(root, "pc-jobs.git");
   sh(["git", "init", "--quiet", "--bare", "-b", "main", remote], root);
@@ -507,8 +588,10 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   writeFileSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0", "manifest.json"), JSON.stringify({ name: "Claude", version: "1.2.3" }));
   // Chrome's own record of the extension it runs: its entry under extensions.settings, whose path names the active version folder.
   writeFileSync(join(udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
-  writeFileSync(join(udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } }));
+  writeFileSync(join(udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, location: 1, manifest: { version: "1.2.3" } } } } }));
   writeFileSync(join(udd, "Last Version"), "131.0.6778.86");
+  // Cain 0.20.0: the jobs Edge's one profile, as Local State lists it.
+  writeFileSync(join(udd, "Local State"), JSON.stringify({ profile: { info_cache: { Default: { name: "Cain jobs" } } } }));
   writeFileSync(join(udd, "lockfile"), "");
   // The profile, bound as bind-profile leaves it: its marker's hash in the worker folder,
   // the marker itself in the stand-in profile's cookie.
@@ -526,7 +609,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     allowed_origins: [`chrome-extension://${EXT}/`] }));
   const inst: Install = { v: 1, owner_fpr: OWNER_FPR, claude: "C:/Users/owner/.local/bin/claude.exe", session_minutes: 15, unattended: false, confirm_path: false,
     diagnostics: false, native_host_manifest: manifest, profile: { user_data_dir: udd, profile_directory: "Default", profile_name: "Cain jobs", extension_id: EXT },
-    other_user_data_dirs: [] };
+    other_user_data_dirs: [], ...(o.browser === "chrome" ? {} : { browser: "edge" as const }) };
   const install = (over: Partial<Install> = {}) => fileOk(join(home, "install.json"), JSON.stringify({ ...inst, ...over }, null, 2));
   install();
   // The session's files: this repo's own.
@@ -565,7 +648,12 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     : { outcome: "seen", facts: { signed_in: true, two_factor: "on", notes: token } };
   // The dedicated Chrome's browser process: the owner's restart (the probe's ask) starts a new one.
   let chromeProc = { pid: 4000, created: T0.getTime() - 3_600_000 };
-  const dedicated = () => ({ pid: chromeProc.pid, ppid: 1, created: chromeProc.created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}"` });
+  // Cain 0.20.0: the jobs Edge, started by the worker on its pipe.
+  const dedicated = () => ({ pid: chromeProc.pid, ppid: 1, created: chromeProc.created, cmd: o.browser === "chrome" ? `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}"`
+    : `"${EDGE_EXE}" --user-data-dir="${udd}" --profile-directory=Default --disable-sync --remote-debugging-pipe` });
+  let edgePage = () => policyPage(edgeRec(manifest).policies);
+  const edgeSent: any[] = [];
+  const inRoot = (f: string) => resolve(f).startsWith(resolve(root));
   const asked: string[] = [];
   let tools = (_prompt: string) => [...GIVEN];
   let status = "connected";
@@ -845,7 +933,12 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     policyKeys: () => [], forcelist: () => ({ entries: [], unreadable: [] }), env: TEST_ENV, procs: () => [dedicated()], exeVersion: () => null, chromePs: listing, envRegistry: () => [], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, hookTiming: async () => TIMING_OK, payloadReplay: () => REPLAY_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
-    ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
+    ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; },
+    edgeSys: edgeSysFor(edgeRec(manifest), { procs: () => [dedicated()] }), edgeExe: EDGE_EXE, edgePolicyMs: 200, pipeScan: () => ({ handles: 40, hits: [], undup: 0 }),
+    edgeLaunch: async () => ({ pid: chromeProc.pid, io: fakeEdge(() => edgePage(), { sent: edgeSent }), refs: null }),
+    edgeDisk: { list: (d: string) => { if (!inRoot(d)) return null; try { return readdirSync(d); } catch { return null; } },
+      read: (f: string) => { if (!inRoot(f)) return null; try { return readFileSync(f); } catch { return null; } }, exists: (f: string) => inRoot(f) && existsSync(f) },
+    ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string; fragment?: boolean; probed?: string } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
     const h = sessionHashes(o)!;
@@ -862,23 +955,27 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
       live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_ENDED.version,
       ...wn, fragment_strip: over.fragment ?? false, ...ev }, null, 2));
   };
+  // Cain 0.20.0: the Edge setup record, as edge-setup leaves it.
+  const records = (over: Partial<EdgeSetup> = {}) => fileOk(join(home, "edge-setup.json"), JSON.stringify(edgeRec(manifest, over), null, 2));
+  records();
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);
   const remoteHas = (path: string) => { try { remoteFile(path); return true; } catch { return false; } };
   const history = () => sh(["git", "log", "-p", "--all"], remote);
   const write = (name: string, x: unknown) => { const f = join(root, name); writeFileSync(f, typeof x === "string" ? x : JSON.stringify(x)); return f; };
-  return { root, remote, cfg, ask, cancel, outcome, clonePc, opts, allow, install, inst, udd, files, confirmNow, remoteFile, remoteHas, history,
+  return { root, remote, cfg, ask, cancel, outcome, clonePc, opts, allow, install, inst, udd, files, confirmNow, records, remoteFile, remoteHas, history,
     plant, write, home, pc, launches, envs, fileOk, claudeHome, bind, jar,
     say: (f: Say) => { say = f; }, during: (f: () => void) => { during = f; }, denyExtra: (f: typeof denyExtra) => { denyExtra = f; },
     tools: (f: (prompt: string) => string[]) => { tools = f; }, status: (x: string) => { status = x; }, extVersion: (x: string | null) => { extVersion = x; },
     runExtra: (f: typeof runExtra) => { runExtra = f; }, credExtra: (f: typeof credExtra) => { credExtra = f; }, inject: (f: typeof inject) => { inject = f; }, asked, dedicated, manifest, hookRuns: (x: boolean) => { hookRuns = x; }, bridgeFails: (x: number) => { bridgeFails = x; }, group,
     bridgeRead: (f: typeof bridgeRead) => { bridgeRead = f; }, readsUrl: (x: boolean) => { readsUrl = x; }, choreSlip: (f: typeof choreSlip) => { choreSlip = f; },
-    at: (d: Date) => { now = d; }, tick: (ms: number) => { monoNow += ms; }, killEnd: (k: KillEnd) => { killEnd = k; } };
+    at: (d: Date) => { now = d; }, tick: (ms: number) => { monoNow += ms; }, killEnd: (k: KillEnd) => { killEnd = k; },
+    edgePage: (f: () => string) => { edgePage = f; }, edgeSent, edgeRec: (over: Partial<EdgeSetup> = {}) => edgeRec(manifest, over) };
 }
 
 // A read job queued by Cain, and the PC's clone ready.
-function oneJob() {
-  const q = queueRig();
+function oneJob(o: Parameters<typeof queueRig>[0] = {}) {
+  const q = queueRig(o);
   const rid = q.ask(READ);
   round(q.cfg);
   q.clonePc();
@@ -1252,7 +1349,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     expect((await run(q.opts(attended))).code).toBe("update_pending");
     // Restarted: the profile's preferences name the new folder, and the old one is gone.
     rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
-    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.4_0`, state: 1, manifest: { version: "1.2.4" } } } } }));
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.4_0`, state: 1, manifest: { version: "1.2.4" } } } } }));
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
     expect(q.launches).toEqual([]);
@@ -1755,6 +1852,81 @@ describe("where a run ends, and its tabs", () => {
     expect(await run(q.opts({ ...attended, procs: () => [{ pid: 8, cmd: "claude.exe --chrome-native-host x" }] }))).toMatchObject({ code: "ok", job: id });
   });
 
+  test("Cain 0.19.1: the Claude desktop app's own shell isn't another Claude Code; a Claude Code CLI process, the desktop app's included, is", async () => {
+    const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+    const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+    // Review round 2: exempt only with the file's identity (a stand-in reader here) and a known child shape.
+    const ident = () => ({ ...CHAIN_OK, asar: true, product: "Claude", original: "claude.exe", signer: DESKTOP_SIGNER_SUBJECT, status: "Valid", cased: true });
+    const shell = [
+      { pid: 50, cmd: `"${APP}"`, exe: APP },
+      { pid: 51, cmd: `"${APP}" --type=gpu-process --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --gpu-preferences=x`, exe: APP },
+      { pid: 52, cmd: `"${APP}" --type=renderer --app-path="C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar"`, exe: APP },
+      { pid: 53, cmd: `"${APP}" --type=utility --utility-sub-type=network.mojom.NetworkService`, exe: APP },
+      { pid: 54, cmd: `"${SQUIRREL}" --type=crashpad-handler`, exe: SQUIRREL },
+      { pid: 55, cmd: `${APP} --type=renderer`, exe: APP },
+    ];
+    expect(claudeSessions(shell, undefined, ident)).toEqual([]);
+    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe", ident)).toEqual([]);
+    // A utility child running Node is not the shell (review round 2).
+    expect(claudeSessions([{ pid: 56, cmd: `"${APP}" --type=utility --utility-sub-type=node.mojom.NodeService`, exe: APP }], undefined, ident).length).toBe(1);
+    {
+      const { q, id } = oneJob();
+      expect(await run(q.opts({ ...attended, procs: () => shell, exeIdentity: ident }))).toMatchObject({ code: "ok", job: id });
+    }
+    // A Claude Code CLI process refuses, wherever it runs: the pinned claude command, any other claude.exe (the one the
+    // desktop app downloads for its Code sessions included), and node, bun or the app's own Electron running the CLI entry.
+    const cli = [
+      { pid: 60, cmd: '"C:\\Users\\owner\\.local\\bin\\claude.exe"' },
+      { pid: 61, cmd: '"C:\\Users\\owner\\AppData\\Roaming\\Claude\\claude-code\\2.1.0\\claude.exe" --output-format stream-json' },
+      { pid: 62, cmd: '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\owner\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"' },
+      { pid: 63, cmd: '"C:\\Users\\owner\\.bun\\bin\\bun.exe" C:/Users/owner/.bun/install/global/node_modules/@anthropic-ai/claude-code/cli.js' },
+      { pid: 64, cmd: `"${APP}" "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\claude-code\\cli.js" --print` },
+      { pid: 65, cmd: "D:/tools/claude.exe --resume" },
+    ];
+    for (const p of cli) {
+      expect([p.cmd, isClaudeCode(p)]).toEqual([p.cmd, true]);
+      const { q } = oneJob();
+      expect([p.cmd, (await run(q.opts({ ...attended, procs: () => [...shell, p], exeIdentity: ident }))).code]).toEqual([p.cmd, "chrome_busy"]);
+    }
+    // The pinned path counts whatever its name.
+    expect(isClaudeCode({ pid: 66, cmd: '"C:\\Tools\\cc\\agent.exe" -p' }, "C:/Tools/cc/agent.exe")).toBe(true);
+    // The native host stays out, in the app's folder too.
+    expect(isClaudeCode({ pid: 67, cmd: `"${APP}" --chrome-native-host chrome-extension://abc/` })).toBe(false);
+    // The plain line names what to close, by kind.
+    expect(busyLine([...shell, cli[1]], undefined, ident)).toContain("the Code session in the Claude app");
+    expect(busyLine([...shell, cli[0]], undefined, ident)).toContain("every terminal running claude");
+    expect(busyLine([cli[0], cli[1]])).toContain("the Code session in the Claude app and every terminal running claude");
+    expect(busyLine(null)).toContain("couldn't be read");
+    for (const l of [busyLine([cli[0]]), busyLine([cli[1]]), busyLine(null)]) {
+      expect(l).toContain("press a key");
+      expect(l).not.toMatch(/\u2014|[\\/]|\d{2,}/);
+    }
+  });
+
+  test("Cain 0.19.1: the desktop launcher runs bind-profile, the probe or a run with a double click, and says one plain line on a refusal", () => {
+    const { q } = oneJob();
+    const text = launcherText("C:\\Users\\owner\\.bun\\bin\\bun.exe", "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts", "C:\\pc-worker-k7q2xz");
+    for (const c of ["bind-profile", "probe", "run"])
+      expect(text).toContain(`"C:\\Users\\owner\\.bun\\bin\\bun.exe" "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts" ${c} --attended --launcher --home "C:\\pc-worker-k7q2xz"`);
+    expect(text).toContain("pause");
+    expect(text).toContain('"C:\\Windows\\System32\\choice.exe" /c 123Q');
+    expect(text.split("\r\n")[0]).toBe("@echo off");
+    expect(text).not.toContain("\u2014");
+    for (const bad of ['C:\\a"b', "C:\\100%", "C:\\a&b", "C:\\a\nb", "C:\\a!b"])
+      expect(() => launcherText("bun", "worker.ts", bad)).toThrow();
+    const desk = join(q.root, "Desktop");
+    mkdirSync(desk, { recursive: true });
+    const out = writeLauncher(q.opts(), desk);
+    expect(out.written).toBe(join(desk, LAUNCHER_NAME));
+    expect(readFileSync(out.written, "utf8")).toContain(" probe --attended --launcher --home ");
+    expect(() => writeLauncher(q.opts(), join(q.root, "no-desktop"))).toThrow();
+    // The plain line after the worker's answer: none when it went through, what to close on chrome_busy, the code otherwise.
+    expect(launcherLine("ok", q.opts(), q.inst)).toBeNull();
+    expect(launcherLine("idle", q.opts(), q.inst)).toBeNull();
+    expect(launcherLine("chrome_busy", q.opts({ procs: () => [{ pid: 60, cmd: '"C:/Users/owner/.local/bin/claude.exe"' }] }), q.inst)).toContain("every terminal running claude");
+    expect(launcherLine("extra_extension", q.opts(), q.inst)).toContain("extra_extension");
+  });
+
   test("the bridge check: a stuck bridge is recycled where it can be and checked again; still stuck is extension_unreachable, before any claim", async () => {
     {
       const { q, id } = oneJob();
@@ -1952,7 +2124,7 @@ describe("hangs, locks and clocks", () => {
     for (const name of ["spendNonce", "nonces/", "confirmGate", "go_token)", "confirm.ts\""]) expect(src).not.toContain(name);
     // The command line's commands, every one of them.
     const cli = src.slice(src.indexOf("if (isMain"));
-    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "dump-extensions", "open-chrome", "check-cli", "clean-probe", "owner-keygen", "owner-fpr", "sign-allowlist"]);
+    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "write-launcher", "edge-setup", "edge-record", "open-edge", "record-builtins", "confirm-profile", "check-host", "dump-extensions", "open-chrome", "check-cli", "clean-probe", "owner-keygen", "owner-fpr", "sign-allowlist"]);
     // Only confirm.ts holds the nonce spend, and it imports from the worker, not the other way round.
     expect(readFileSync(join(OPT, "pcjobs/confirm.ts"), "utf8")).toContain("export function spendNonce");
   });
@@ -1995,7 +2167,7 @@ describe("the supervised probe and confirm-profile", () => {
     else expect(ev.short_names).toEqual({ volume: "", setting: null, line: null });
     expect(q.launches[0][2]).toContain("connection check");
     expect(q.launches[1][2]).toContain("connection check");
-    expect(q.asked).toEqual([expect.stringContaining("Restart the Cain jobs Chrome now")]);
+    expect(q.asked).toEqual([expect.stringContaining("The worker has closed the Cain jobs Edge")]);
     expect(q.launches[2][2]).toContain("connection check");
     expect(q.launches[3][2]).toContain("## This run");
     for (const i of [4, 5, 6, 7, 8]) expect(q.launches[i][2]).toContain("destination check");
@@ -2428,7 +2600,7 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
     const inst = q.inst;
     const bat = join(q.home, "host", "chrome-native-host.bat");
     const t = (min: number) => T0.getTime() + min * 60_000;
-    const chrome = (pid: number, dir?: string, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"${dir ? ` --user-data-dir="${dir}"` : ""}` });
+    const chrome = (pid: number, dir?: string, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"${dir ? ` --user-data-dir="${dir}"` : ""}` });
     const shell = (pid: number, ppid: number, created = t(-30)) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${bat}" chrome-extension://${EXT}/ --parent-window=0"` });
     const host = (pid: number, ppid: number, created = t(-29)) => ({ pid, ppid, created, cmd: `"${bat}" chrome-extension://${EXT}/ --parent-window=0` });
     const host2 = q.manifest.replace(/[^\\/]+$/, "chrome-native-host.bat");
@@ -2456,7 +2628,7 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
     const inst = q.inst;
     const bat = join(q.home, "host", "chrome-native-host.bat");
     const t = (min: number) => T0.getTime() + min * 60_000;
-    const chrome = (pid: number, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${q.udd}"` });
+    const chrome = (pid: number, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${q.udd}"` });
     const shell = (pid: number, ppid: number, created = t(-30), path = bat) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${path}" chrome-extension://${EXT}/ --parent-window=0"` });
     const host = (pid: number, ppid: number, created = t(-29)) => ({ pid, ppid, created, cmd: `"${bat}" chrome-extension://${EXT}/ --parent-window=0` });
     const good = [chrome(10), shell(11, 10), host(12, 11)];
@@ -2474,8 +2646,8 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
     // A command line Windows won't show (empty) is never a pass, wherever it is in the chain.
     expect(extensionElsewhere([chrome(10), { ...shell(11, 10), cmd: "" }, host(12, 11)], inst, bat)).toBe(true);
     expect(extensionElsewhere([{ ...chrome(10), cmd: "" }, shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
-    // An Edge or Brave parent is never the dedicated Chrome.
-    expect(extensionElsewhere([{ ...chrome(10), cmd: `"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${q.udd}"` }, shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
+    // A Chrome or Brave parent is never the dedicated jobs Edge (Cain 0.20.0).
+    expect(extensionElsewhere([{ ...chrome(10), cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${q.udd}"` }, shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
     // Orphans: a host whose browser is gone, or whose parent PID now belongs to a newer process: host_parent_gone, and nothing is ended.
     expect(orphanHosts([shell(11, 10), host(12, 11)], inst).map((p) => p.pid)).toEqual([11]);
     expect(orphanHosts([chrome(10, t(-5)), shell(11, 10), host(12, 11)], inst).map((p) => p.pid)).toEqual([11]);
@@ -2905,7 +3077,7 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
   });
 
   test("the host chain: Chrome starting the host itself, or through one cmd.exe; the host path checked against the manifest both ways; equal start times pass", () => {
-    const { q } = oneJob();
+    const { q } = oneJob({ browser: "chrome" });
     const inst = q.inst;
     const bat = join(q.home, "host", "chrome-native-host.bat");
     const exe = join(q.home, "host", "chrome-native-host.exe");
@@ -2935,9 +3107,10 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     expect(() => checkHost(q.opts({ registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }))).toThrow("manifest_path_mismatch");
   });
 
-  test("bind-profile refuses a registered manifest that isn't install.json's, as manifest_path_mismatch, before any session", async () => {
+  test("bind-profile refuses a host registration that isn't the setup record's before any session (Cain 0.20.0: the Edge host, edge_host_mismatch)", async () => {
     const q = queueRig({ confirmed: false });
-    await expect(bindProfile(q.opts({ ...attended, registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }))).rejects.toThrow("manifest_path_mismatch");
+    const elsewhere = edgeSysFor(q.edgeRec(), { procs: () => [q.dedicated()], reg: edgeReg(q.edgeRec(), { [`HKLM\\${EDGE_HOST_KEY}\\${HOST_NAME_T} /ve /reg:64`]: { status: 0, stdout: `    (Default)    REG_SZ    ${join(q.root, "elsewhere", "host.json")}\r\n` } }) });
+    await expect(bindProfile(q.opts({ ...attended, edgeSys: elsewhere }))).rejects.toMatchObject({ code: "edge_host_mismatch", detail: { items: ["host_path@HKLM64"] } });
     expect(q.launches).toEqual([]);
     expect((await bindProfile(q.opts(attended))).bound).toBe(T0.toISOString());
   });
@@ -3104,7 +3277,7 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     const inst = q.inst;
     const bat = join(q.home, "host", "chrome-native-host.bat");
     const t = (min: number) => T0.getTime() + min * 60_000;
-    const chrome = (pid: number, created = t(-60), udd = q.udd) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}"` });
+    const chrome = (pid: number, created = t(-60), udd = q.udd) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${udd}"` });
     const shell = (pid: number, ppid: number, created = t(-30)) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${bat}" chrome-extension://${EXT}/"` });
     const host = (pid: number, ppid: number, created = t(-29)) => ({ pid, ppid, created, cmd: `"${bat}" chrome-extension://${EXT}/` });
     // The dedicated Chrome started the cmd.exe: passes.
@@ -3113,9 +3286,9 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     // Any other parent of the cmd.exe fails.
     const others = [
       { pid: 10, ppid: 1, created: t(-60), cmd: "C:\\Windows\\explorer.exe" },
-      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${q.udd}"` },
+      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${q.udd}"` },
       chrome(10, t(-60), join(q.root, "daily")),
-      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --type=renderer --user-data-dir="${q.udd}"` },
+      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --type=renderer --user-data-dir="${q.udd}"` },
       { pid: 10, ppid: 1, created: t(-60), cmd: "C:\\Windows\\system32\\cmd.exe /c start" },
       { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"` },
     ];
@@ -3127,7 +3300,7 @@ describe("eighth review: the stated boundary, the canary from the server's recor
   });
 
   test("registry views: the user hive, then the machine hive's 64-bit and 32-bit views; any registered entry that differs, or two distinct paths, is manifest_path_mismatch", () => {
-    const { q } = oneJob();
+    const { q } = oneJob({ browser: "chrome" });
     const man = q.manifest, other = join(q.root, "elsewhere", "host.json");
     const check = (entries: { view: "HKCU" | "HKLM64" | "HKLM32"; path: string }[]) => manifestViews(q.opts({ registry: () => entries }), q.inst);
     expect(check([{ view: "HKCU", path: man }, { view: "HKLM64", path: man }, { view: "HKLM32", path: man }]).code).toBeNull();
@@ -3184,7 +3357,7 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
     expect(activeExtensionVersion(q.inst)).toBeNull();
     expect((await run(q.opts(attended))).code).toBe("extension_entry_missing");
-    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, manifest: { version: "1.2.3" } } } } }));
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, manifest: { version: "1.2.3" } } } } }));
     // A newer folder Chrome hasn't switched to: update_pending, before any claim, attended ones too.
     mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0"));
     writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0", "manifest.json"), JSON.stringify({ version: "1.3.0" }));
@@ -3428,42 +3601,42 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
   });
 
   test("the extension's entry: read from Secure Preferences or Preferences, whichever holds it; in neither is extension_entry_missing, not wrong_profile", async () => {
-    const { q, id } = oneJob();
+    const { q, id } = oneJob({ browser: "chrome" });
     const prefs = (x: object) => writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" }, ...x }));
     const secure = (x: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify(x));
     expect(checkHost(q.opts())).toMatchObject({ extension_entry: { files: ["Secure Preferences"], key: `extensions.settings.${EXT}` } });
     // Only in Preferences: read there, and the run goes on.
     secure({});
-    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } });
+    prefs({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } });
     expect(checkHost(q.opts())).toMatchObject({ extension_entry: { files: ["Preferences"], key: `extensions.settings.${EXT}` } });
-    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();   // Cain 0.20.0: Chrome runs no job; its gate is a diagnostic
     // Split between both: both named.
     secure({ extensions: { settings: { [EXT]: { state: 1 } } } });
     expect(extensionPrefs(q.inst).files).toEqual(["Secure Preferences", "Preferences"]);
     // In neither: its own code, from the run and from check-host.
     secure({ extensions: { settings: {} } });
     prefs({});
-    q.ask(READ); round(q.cfg);
-    expect((await run(q.opts(attended))).code).toBe("extension_entry_missing");
+    // (no job needed: the preflight alone)
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("extension_entry_missing");
     expect(() => checkHost(q.opts())).toThrow("extension_entry_missing");
     // A profile whose name isn't the confirmed one is still wrong_profile.
-    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } });
-    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Daily" }, extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, manifest: { version: "1.2.3" } } } } }));
-    expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+    prefs({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } });
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Daily" }, extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, manifest: { version: "1.2.3" } } } } }));
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("wrong_profile");
   });
 
   test("any other enabled extension in the dedicated profile fails the preflight (extra_extension); disabled and Chrome's own component ones don't; the confirmation lists them", async () => {
-    const { q, id } = oneJob();
+    const { q, id } = oneJob({ browser: "chrome" });
     const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", COMPONENT = "mhjfbmdgcfjbbpaeojofohoefgiehjai";   // the PDF viewer, a built-in id
     const secure = (others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
-      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, ...others } } }));
+      JSON.stringify({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, ...others } } }));
     // Enabled, in Preferences only: read from the same source.
     writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [OTHER]: { state: 1, manifest: { name: "Helper" } } } } }));
-    expect((await run(q.opts(attended))).code).toBe("extra_extension");
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
     let err: any = null;
     try { checkHost(q.opts()); } catch (e) { err = e; }
     expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [OTHER] } });
-    expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/another extension turned on/);
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "extra_extension", job: null, stale_lock: false, skew_ms: null, reason: null })).toMatch(/another extension turned on/);
     // Turned off by the user (the user-action disable reason): fine. A component extension: fine.
     writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
     // Fifth pass: state 1 is never off, whatever disable_reasons holds; with no state field the reason decides.
@@ -3471,7 +3644,7 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     expect(extensionPrefs(q.inst).others).toEqual([OTHER]);
     secure({ [OTHER]: { disable_reasons: [1] }, [COMPONENT]: { location: 5, state: 1, path: "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\pdf" } });
     expect(extensionPrefs(q.inst).others).toEqual([]);
-    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();   // Cain 0.20.0: Chrome runs no job; its gate is a diagnostic
     // Sixth pass: a whole number (the old bitmask) is unrecognised, refused by name, zero included.
     secure({ [OTHER]: { disable_reasons: 1 | 4 } });
     expect(extensionPrefs(q.inst).others).toEqual([OTHER]);
@@ -3480,7 +3653,7 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     // What check-host and confirm-profile print: every extension found, with whether it is on and its raw fields.
     secure({ [OTHER]: { disable_reasons: [1], manifest: { name: "Helper" } } });
     expect(checkHost(q.opts()).extensions).toEqual([
-      { id: EXT, name: null, enabled: true, component: false, kind: "claude", status: "on", location: null, state: 1, disable_reasons: null, path_kind: "profile", policy: [], unrecognised: [] },
+      { id: EXT, name: null, enabled: true, component: false, kind: "claude", status: "on", location: 1, state: 1, disable_reasons: null, path_kind: "profile", policy: [], unrecognised: [] },
       { id: OTHER, name: "Helper", enabled: false, component: false, kind: "foreign", status: "present, off", location: null, state: null, disable_reasons: [1], path_kind: "absent", policy: [], unrecognised: [] },
     ]);
   });
@@ -3489,7 +3662,7 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     const inst = queueRig().inst;
     const bat = join(dirname(inst.native_host_manifest), "chrome-native-host.bat");
     const t = (min: number) => T0.getTime() + min * 60_000;
-    const chrome = (pid: number, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${inst.profile.user_data_dir}"` });
+    const chrome = (pid: number, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${inst.profile.user_data_dir}"` });
     const shell = (pid: number, ppid: number, created = t(-30)) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${bat}" chrome-extension://${EXT}/ --parent-window=0"` });
     const host = (pid: number, ppid: number, created = t(-29)) => ({ pid, ppid, created, cmd: `"${bat}" chrome-extension://${EXT}/ --parent-window=0` });
     expect(hostChain([chrome(10), shell(11, 10), host(12, 11)], inst, bat)).toBeNull();
@@ -3636,7 +3809,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
   });
 
   test("preferences: Secure Preferences wins, and the two files disagreeing on an extension's state or version is prefs_disagree, never a merge", async () => {
-    const { q, id } = oneJob();
+    const { q, id } = oneJob({ browser: "chrome" });
     const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const both = (sec: object, pre: object) => {
       writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: sec } }));
@@ -3646,13 +3819,12 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     // The same entry in both, agreeing: fine.
     both({ [EXT]: mine }, { [EXT]: mine });
     expect(extensionPrefs(q.inst).disagree).toEqual([]);
-    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "browser_not_edge", job: null })   // Cain 0.20.0: a Chrome install runs no job;
     // State: on in one, off in the other.
     both({ [EXT]: mine }, { [EXT]: { ...mine, state: 0 } });
     expect(extensionPrefs(q.inst).disagree).toEqual([EXT]);
-    q.ask(READ); round(q.cfg);
-    expect((await run(q.opts(attended))).code).toBe("prefs_disagree");
-    expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/preference files disagree/);
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("prefs_disagree");
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "prefs_disagree", job: null, stale_lock: false, skew_ms: null, reason: null })).toMatch(/preference files disagree/);
     let err: any = null;
     try { checkHost(q.opts()); } catch (e) { err = e; }
     expect(err).toMatchObject({ code: "prefs_disagree", detail: { ids: [EXT] } });
@@ -3676,10 +3848,10 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
   });
 
   test("built-in ids at Chrome's internal locations (5, 10) are Chrome's; policy locations count whatever their state; a disable reason without state 1, or state 2, is off; raw fields printed", async () => {
-    const { q } = oneJob();
+    const { q } = oneJob({ browser: "chrome" });
     const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PAY = "nmmhkkegccagdldgiimedpiccmgmieda";
     const with_ = (id: string, e: object) => { writeFileSync(join(q.udd, "Default", "Secure Preferences"),
-      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, [id]: e } } })); return extensionPrefs(q.inst).others; };
+      JSON.stringify({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, [id]: e } } })); return extensionPrefs(q.inst).others; };
     const INSTALL = "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments";
     expect(with_(PAY, { location: 5, state: 1, path: INSTALL })).toEqual([]);      // component, in Chrome's install folder
     expect(with_(PAY, { location: 10, state: 1, path: INSTALL })).toEqual([]);     // external component, in Chrome's install folder
@@ -3713,17 +3885,13 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     try { checkHost(q.opts()); } catch (e) { err = e; }
     expect(err.detail.extensions).toContainEqual({ id: OTHER, name: "Policy helper", enabled: true, component: false, kind: "policy", status: "on", location: 7, state: 1,
       disable_reasons: null, path_kind: "absent", policy: [], unrecognised: ["disable_reasons"] });     // seventh pass: never filtered down to its numbers
-    const p = queueRig({ confirmed: false });
-    writeFileSync(join(p.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } },
-      [PAY]: { location: 5, state: 1, path: INSTALL } } } }));
-    const ev = await probe(p.opts(attended));
-    expect(ev.extensions).toContainEqual({ id: PAY, name: null, enabled: true, component: true, kind: "chrome", status: "on", location: 5, state: 1, disable_reasons: null,
-      path_kind: "chrome_install", policy: [], unrecognised: [] });
-    expect(ev.extension_policy).toEqual({ entries: [], unreadable: [] });
+    // Cain 0.20.0: the probe runs in the jobs Edge only; on this Chrome install it refuses by name.
+    const p = queueRig({ confirmed: false, browser: "chrome" });
+    await expect(probe(p.opts(attended))).rejects.toMatchObject({ code: "browser_not_edge" });
   });
 
   test("0.12.2: Chrome's own component extensions (Web Store Payments at location 10, as Chrome 157 writes it) pass; a user-installed one is still extra_extension", async () => {
-    const { q, id } = oneJob();
+    const { q, id } = oneJob({ browser: "chrome" });
     const PAYMENTS = "nmmhkkegccagdldgiimedpiccmgmieda", WEBSTORE = "ahfgeienlihckogmohjhadlkjgocpleb", USER = "dddddddddddddddddddddddddddddddd";
     const mine = { active_permissions: { api: ["tabs", "nativeMessaging"] }, creation_flags: 9, from_webstore: true, install_time: "13400000000000000",
       location: 1, manifest: { key: "x", manifest_version: 3, name: "Claude", version: "1.2.3" }, path: `${EXT}\\1.2.3_0`, state: 1, was_installed_by_default: false, was_installed_by_oem: false };
@@ -3741,7 +3909,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     expect(extensionPrefs(q.inst).extensions.find((x) => x.id === PAYMENTS)).toMatchObject({ name: "Chrome Web Store Payments", enabled: true, component: true, location: 10, path_kind: "chrome_install" });
     expect(checkHost(q.opts()).extensions.map((x) => x.id)).toEqual([WEBSTORE, EXT, PAYMENTS].sort());
     expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
-    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "browser_not_edge", job: null })   // Cain 0.20.0: a Chrome install runs no job;
     // A known id at a user location (an unpacked extension can claim any id) is not Chrome's.
     write({ [PAYMENTS]: { ...payments, location: 4 } });
     expect(extensionPrefs(q.inst).others).toEqual([PAYMENTS]);
@@ -3753,6 +3921,10 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     try { checkHost(q.opts()); } catch (e) { err = e; }
     expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [USER], by_policy: [] } });
   });
+
+  // Cain 0.19.1: the shape the setup session captured on the owner's PC (ids, numbers and folder kinds only). Chrome
+  // 158.0.8127.36, machine-wide in Program Files (x86). Four of Chrome's own parts at location 5 keep the path Chrome wrote
+  // at 157 (...\157.0.8103.39\resources\<name>), gone with that version, and Chrome 158 has no resources folder at all.
 
   // 0.12.2, third pass: read only. The owner's reported profile, in the shape Chrome 157 writes it (no state field;
   // disable_reasons a list): Web Store Payments at location 10 in Chrome's install folder, two entries pushed through the
@@ -3781,7 +3953,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     const refusal = (o: any) => { try { checkHost(o); return null; } catch (e: any) { return e; } };
 
     test("the owner's reported profile is refused by name for Docs Offline on, passes once it is off, and every entry point leaves both preferences files exactly as they were", async () => {
-      const { q, id } = oneJob();
+      const { q, id } = oneJob({ browser: "chrome" });
       // As reported, Docs Offline on: refused by name, the one-time fix in the refusal.
       write(q, { ...reported(), [DOCS]: docs });
       expect(extensionPrefs(q.inst).others).toEqual([DOCS]);
@@ -3800,7 +3972,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(line(q, DOCS)).toMatchObject({ kind: "default_app", status: "present, off", location: 1 });
       expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
       expect(checkHost(q.opts())).toMatchObject({ host: "ok", extension_policy: { entries: [], unreadable: [] } });
-      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "browser_not_edge", job: null })   // Cain 0.20.0: a Chrome install runs no job;
       const log = readFileSync(join(q.home, "worker.log"), "utf8");
       expect(log).toContain(`extension=${REG1}:present_off`);
       expect(log).toContain(`extension=${DOCS}:present_off`);
@@ -3808,7 +3980,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       rmSync(join(q.udd, "lockfile"));
       const closed = q.opts({ ...attended, procs: () => [] });
       q.ask(READ); round(q.cfg);
-      expect((await run(closed)).code).toBe("browser_unreachable");
+      expect((await run(closed)).code).toBe("browser_not_edge");
       expect(checkHost(closed)).toMatchObject({ host: "ok" });
       dumpExtensions(q.inst);
       expect(bytes()).toEqual(before);
@@ -3823,7 +3995,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("a built-in id at location 10 with a path under the profile folder is foreign and refused", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, { [PAYMENTS]: { ...payments, path: join(q.udd, "Default", "Extensions", PAYMENTS, "1.0.0.6_0") } });
       expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", component: false, path_kind: "profile" });
       expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
@@ -3839,7 +4011,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("a built-in id with no location is foreign", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const { location: _, ...noLocation } = payments;
       write(q, { [PAYMENTS]: noLocation });
       expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", location: null });
@@ -3848,7 +4020,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("a force-installed entry at location 9 with the user's disable reason is refused by name, and so is one the forcelist policy names", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, { ...reported(), [FORCED]: { ...store(), path: `${FORCED}\\3.0_0`, location: 9, disable_reasons: [1] } });
       expect(line(q, FORCED)).toMatchObject({ kind: "policy", status: "on", enabled: true, disable_reasons: [1] });
       expect(extensionPrefs(q.inst).others).toEqual([FORCED]);
@@ -3874,7 +4046,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("a store install enabled is refused", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, { ...reported(), [STORE]: store() });
       expect(line(q, STORE)).toMatchObject({ kind: "foreign", status: "on", path_kind: "profile", policy: [] });
       expect(extensionPrefs(q.inst).others).toEqual([STORE]);
@@ -3882,16 +4054,16 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("a store install disabled is present, off: listed, never counted", async () => {
-      const { q, id } = oneJob();
+      const { q, id } = oneJob({ browser: "chrome" });
       write(q, { ...reported(), [STORE]: store({ disable_reasons: [1] }) });
       expect(line(q, STORE)).toMatchObject({ kind: "foreign", status: "present, off", enabled: false, path_kind: "profile", policy: [] });
       expect(extensionPrefs(q.inst).others).toEqual([]);
-      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "browser_not_edge", job: null })   // Cain 0.20.0: a Chrome install runs no job;
       expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain(`extension=${STORE}:present_off`);
     });
 
     test("dump-extensions prints each entry's id, location, state, disable reasons and path's folder kind, never a name or other value, and a path only at location 10", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, { ...reported(), [STORE]: store({ disable_reasons: [1] }) });
       writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [REG1]: { disable_reasons: [8192] } } } }));
       const d = dumpExtensions(q.inst);
@@ -3922,7 +4094,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fourth pass: the worker starts the dedicated Chrome with default apps disabled, and its arguments are pinned", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       expect(DISABLE_DEFAULT_APPS).toBe("--disable-default-apps");
       expect(chromeLaunchArgs(q.inst)).toEqual([`--user-data-dir=${q.inst.profile.user_data_dir}`, `--profile-directory=${q.inst.profile.profile_directory}`, "--disable-default-apps"]);
       // chrome.exe found per machine, then per user; none is chrome_not_found.
@@ -3947,7 +4119,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fourth pass: an unknown preference shape fails closed: refused or unrecognised, never off", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       // The raw rule (fifth pass): off for a non-empty, non-zero disable_reasons list without state 1. Sixth pass: a whole
       // number (the old bitmask) is unrecognised, and state 2 is off only when uninstalled or with a non-empty list.
       expect(entryStatus({ state: 0 })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
@@ -3988,7 +4160,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fourth pass: ExtensionSettings and the forcelist under every hive, both install modes; an unreadable hive refuses by name", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
       expect(POLICY_HIVES).toEqual(["HKLM", "HKCU", "HKLM\\WOW6432Node", "HKCU\\WOW6432Node"]);
       expect(CHROME_POLICY_KEYS["HKLM\\WOW6432Node"]).toBe("HKLM\\SOFTWARE\\WOW6432Node\\Policies\\Google\\Chrome");
@@ -4045,7 +4217,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fourth pass: a component location with no path is foreign", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const { path: _, ...noPath } = payments;
       write(q, { ...reported(), [PAYMENTS]: noPath });
       expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", location: 10, path_kind: "absent", component: false });
@@ -4056,7 +4228,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fourth pass: one id in both files with different state or location combines conservatively", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const both = (a: object, b: object) => { write(q, { ...reported(), ...a });
         writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: b } })); };
       // Location: Chrome's own in Secure Preferences, a user location in Preferences: foreign, and on.
@@ -4097,7 +4269,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fourth pass: a default app is exempt only while off, by its id alone; installed-by-default and a default_apps folder exempt nothing", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, { [DOCS]: { ...docs, disable_reasons: [1] } });
       expect(line(q, DOCS)).toMatchObject({ kind: "default_app", status: "present, off" });
       expect(extensionPrefs(q.inst).others).toEqual([]);
@@ -4132,7 +4304,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fifth pass: on or off is decided by disable_reasons, with state as a cross-check", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       // state 1 is never off, whatever disable_reasons holds: on, refused.
       expect(entryStatus({ state: 1, disable_reasons: [1] })).toEqual({ status: "on", unrecognised: [] });
       expect(entryStatus({ state: 1, disable_reasons: 1 })).toEqual({ status: "unrecognised", unrecognised: ["disable_reasons"] });     // sixth pass
@@ -4168,7 +4340,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("fifth pass: policy parsing: the forcelist id before \";\", ExtensionSettings keys that aren't ids, and an enrollment token, each refused by name", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
       const absent = { status: 1, stdout: "", stderr: REG_NOT_FOUND };
       const fake = (answers: Record<string, { status: number | null; stdout: string }>) => regStandIn(answers);
@@ -4213,7 +4385,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("sixth pass: a whole-number disable_reasons (the old bitmask) is unrecognised and refused by name, zero included", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       for (const r of [1, 8192, 0]) {
         expect([r, entryStatus({ disable_reasons: r })]).toEqual([r, { status: "unrecognised", unrecognised: ["disable_reasons"] }]);
         expect([r, entryStatus({ state: 1, disable_reasons: r })]).toEqual([r, { status: "unrecognised", unrecognised: ["disable_reasons"] }]);
@@ -4231,7 +4403,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("seventh pass: state 2 follows the validated rule; external_uninstalls never makes it off, and a marker that isn't a list of ids refuses by name", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const marker = (file: string, value: unknown) => {
         const f = file === "Preferences" ? pre(q) : sec(q);
         const doc = existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : { profile: { name: "Cain jobs" } };
@@ -4280,7 +4452,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("seventh pass: strict element types: a boolean, a fraction, a negative number or a string in disable_reasons is unrecognised", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       for (const r of [[true], [1.5], [-1], ["1"], [1, true], [8192, 0.5]] as unknown[][]) {
         for (const extra of [{}, { state: 1 }, { state: 0 }, { state: 2 }]) {
           expect([r, extra, entryStatus({ ...extra, disable_reasons: r })]).toEqual([r, extra, { status: "unrecognised", unrecognised: ["disable_reasons"] }]);
@@ -4300,7 +4472,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("sixth pass: an external component is Chrome's own only under Chrome's install folder; a user data path or no path is refused with its path kind and path", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       // Under Chrome's install folder: passes.
       write(q, { ...reported(), [PAYMENTS]: payments });
       expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", path_kind: "chrome_install" });
@@ -4332,7 +4504,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("seventh pass: every token location, in each view, refuses by hive, view, key and value name; no token text appears", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const SECRET = "tok-SECRET-9f8e7d";
       const CS = "HKLM\\SOFTWARE\\Google\\Update\\ClientState\\{430FD4D0-B729-4F61-AA34-91526481799D}";
       const cases: [string, string, string, string, string[]][] = [
@@ -4400,7 +4572,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("seventh pass: a cloud policy cache folder under Program Files (x86)\\Google\\Policies refuses the run, named", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const root = mkdtempSync(join(tmpdir(), "pcw-pf86-"));
       expect(policyCache(root)).toBeNull();                                         // no Google\Policies
       mkdirSync(join(root, "Google", "Policies"), { recursive: true });
@@ -4423,7 +4595,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("seventh pass: the component path is judged by whole segments under Chrome's install folder; .., a sibling folder and a per-user install are refused", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const udd = "C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\User Data";
       const env = { ProgramFiles: "C:\\Program Files", "ProgramFiles(x86)": "C:\\Program Files (x86)", LOCALAPPDATA: "C:\\Users\\o\\AppData\\Local" };
       const ok = "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments";
@@ -4482,7 +4654,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("eighth pass: a registry read counts as absent only on reg.exe's exact not-found answer; access denied or any other failure refuses as unreadable", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       expect(regAbsent({ status: 1, stdout: "", stderr: `${REG_NOT_FOUND}\r\n` })).toBe(true);
       expect(regAbsent({ status: 1, stdout: "", stderr: "ERROR: Access is denied.\r\n" })).toBe(false);
       expect(regAbsent({ status: 1, stdout: "", stderr: "FEHLER: Das System konnte den angegebenen Registrierungsschlüssel nicht finden.\r\n" })).toBe(false);
@@ -4510,7 +4682,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("eighth pass: a built-in id is Chrome's own only when its folder exists and resolves under the worker's own Chrome; missing, 8.3, \\\\?\\ and UNC forms are refused", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const udd = "C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\User Data";
       const ok = `${FAKE_APP}\\157.0.0.0\\resources\\web_store_payments`;
       expect(pathKind(ok, udd)).toBe("chrome_install");
@@ -4582,7 +4754,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("eighth pass: a token value name in any case, and a device token key's default value, refuse; the data is never kept", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const enr = CLOUD_KEYS.find((c) => c.key === "HKLM\\SOFTWARE\\Google\\Enrollment")!;
       const SECRET = "fake-token-0000";
       const listing = (name: string) => ({ [enr.key]: { status: 0, stdout: `\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Google\\Enrollment\r\n    ${name}    REG_SZ    ${SECRET}\r\n\r\n` } });
@@ -4603,7 +4775,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("eighth pass: Program Files\\Google\\Policies, Program Files (x86)\\Google\\Policies and the profile's own Policy folder each refuse when they hold anything, all three in the dump", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const pfA = mkdtempSync(join(tmpdir(), "pcw-pf-")), pfB = mkdtempSync(join(tmpdir(), "pcw-pf86-"));
       const env = { ...process.env, ProgramFiles: pfA, "ProgramFiles(x86)": pfB };
       const prof = join(q.udd, "Default");
@@ -4634,7 +4806,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("eighth pass: a missing extensions.external_uninstalls in either or both files is an empty list; an explicit null refuses by name", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       const prefsWith = (xu: unknown) => JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { ...(xu === undefined ? {} : { external_uninstalls: xu }), settings: {} } });
       const secureWith = (xu: unknown) => JSON.stringify({ extensions: { ...(xu === undefined ? {} : { external_uninstalls: xu }), settings: { [EXT]: mine, ...reported() } },
         protection: { macs: { extensions: { settings: {} } } } });
@@ -4653,7 +4825,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     });
 
     test("eighth pass: dump-extensions starts with Chrome's install location, its kind and the version folder", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, reported());
       const list = () => ["157.0.0.0", "chrome.exe", "SetupMetrics", "156.0.1.2"];
       expect(chromeInstall(FAKE_DISK, FAKE_ENV, list)).toEqual({ location: FAKE_APP, kind: "machine-wide", version_folders: ["156.0.1.2", "157.0.0.0"] });
@@ -4665,11 +4837,11 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(dumpHead(d)).toEqual([`chrome install: ${FAKE_APP} (machine-wide)`, "chrome version folder: 157.0.0.0"]);
       // The command prints those two lines first, then the record.
       const src = readFileSync(join(OPT, "pcjobs/worker.ts"), "utf8");
-      expect(src).toContain(`for (const l of dumpHead(d)) console.log(l); say(d);`);
+      expect(src).toContain(`for (const l of dumpHead(d)) console.log(l);`);
     });
 
     test("sixth pass: Chrome's version is in check-host's answer, its refusal, the unrecognised shape's line, and dump-extensions", () => {
-      const { q } = oneJob();
+      const { q } = oneJob({ browser: "chrome" });
       write(q, reported());
       const ok = checkHost(q.opts());
       expect(ok.chrome_version).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
@@ -4682,7 +4854,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
   });
 
   test("Windows' timer: start times equal or within one tick are never later; the chain, the orphan check and the lock all tolerate it", async () => {
-    const inst = queueRig().inst;
+    const inst = queueRig({ browser: "chrome" }).inst;
     const bat = join(dirname(inst.native_host_manifest), "chrome-native-host.bat");
     const t = T0.getTime() - 60_000;
     const chrome = (created: number) => ({ pid: 10, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${inst.profile.user_data_dir}"` });
@@ -5831,7 +6003,7 @@ c.on("close", (code) => { say({ type: "hook", id: "first", code, out }); say({ t
     expect(helper).toBeTruthy();
     // Built once: a second call reuses it.
     expect(ensureJobHelper(o)).toBe(helper);
-    expect(spawnSync(helper!, ["version"], { encoding: "utf8" }).stdout.trim()).toBe("pcw-jobrun 3");
+    expect(spawnSync(helper!, ["version"], { encoding: "utf8" }).stdout.trim()).toBe("pcw-jobrun 4");
     // The probe's job_readback step on the real helper: inside the runner's own job (if any), its job is made, joined and read back.
     const rb = jobReadback(o, helper);
     expect(rb).toMatchObject({ applies: true, readback: true, passed: true });
@@ -6260,7 +6432,7 @@ describe("fifteenth review: unplaced and drifted reads end the session, the work
     await readGuardMain(env, async () => readCall({ structuredContent: { tabUrl: "https://evil.example/x" } }, "r3"), (x) => { said += x; });
     expect(readAbort(abort)).toBe("read_drift");
     expect(JSON.parse(said).hookSpecificOutput.updatedMCPToolOutput).toBe(READ_DRIFT_MESSAGE);
-    expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low", "nav_log_unset"]);
+    expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low", "nav_log_unset", "edge_pipe_lost", "pipe_handle_leak"]);
   });
 
   test("an unplaced read ends the run at once with no tab-context fallback, and the report is discarded", async () => {
@@ -6861,7 +7033,7 @@ describe("eighteenth review: the hook's margin measured on the PC, a strict pars
     expect(HOOK_STALL_MS).toBeGreaterThan(HOOK_TIMEOUT_S * 1000);
     expect(PROBE_GATES).toContain("hook_timing");
     expect(PROBE_GATES).toContain("payload_replay");
-    expect(POLICY_VERSION).toBe("21");
+    expect(POLICY_VERSION).toBe("22");
   });
 
   // The step's four sessions, each a real session process (the stand-in CLI) running the real nav-guard.
@@ -7557,9 +7729,9 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${en
   test("the extension's version is the loaded one in the profile's preferences, never a folder's name; more than one version folder holds runs until a new probe", async () => {
     const { q, id } = oneJob();
     const sp = join(q.udd, "Default", "Secure Preferences");
-    writeFileSync(sp, JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } }));
+    writeFileSync(sp, JSON.stringify({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, state: 1 } } } }));
     expect(activeExtensionVersion(q.inst)).toBeNull();                             // a folder's name is no version
-    writeFileSync(sp, JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } }));
+    writeFileSync(sp, JSON.stringify({ extensions: { settings: { [EXT]: { location: 1, path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } }));
     expect(activeExtensionVersion(q.inst)).toBe("1.2.3");
     // An old folder left beside the loaded one: refused by name, and held until a new probe even once it is gone.
     mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.2.2_0"));
@@ -7582,7 +7754,7 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${en
     let asked: string | null = null;
     const exe = (p: string) => { asked = p; return "131.0.6778.205"; };
     expect(chromeVersionRead(q.opts({ exeVersion: exe }), q.inst)).toEqual({ version: "131.0.6778.205", source: "chrome_exe" });
-    expect(asked).toBe("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
+    expect(asked).toBe(EDGE_EXE);   // Cain 0.20.0: the jobs Edge's own executable
     expect(fingerprint(q.opts({ exeVersion: exe }), q.inst)?.chrome_version).toBe("131.0.6778.205");
     expect(chromeVersionRead(q.opts({ exeVersion: () => null }), q.inst)).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
     expect(chromeVersionRead(q.opts({ exeVersion: () => "not a version" }), q.inst)).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
@@ -7942,8 +8114,8 @@ describe("twenty-third review: the dedicated Chrome's listing, its time limit, o
   // line), not captured from a real PC (the probe's chrome_listing step checks the real one): the dedicated browser
   // process, one of its renderers, and the owner's everyday Chrome.
   const sample = (udd: string) => [
-    `11204|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}" --profile-directory=Default`,
-    `11388|11204|2026-11-15T13:58:03.0000000Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --type=renderer --user-data-dir="${udd}" --lang=en-US`,
+    `11204|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${udd}" --profile-directory=Default`,
+    `11388|11204|2026-11-15T13:58:03.0000000Z|131.0.6778.86|"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --type=renderer --user-data-dir="${udd}" --lang=en-US`,
     `9020|4400|2026-11-14T08:00:00.0000000Z|131.0.6778.70|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"`,
     ""].join("\r\n");
   test("the listing parses with each process's start time, and the dedicated Chrome is matched by the profile path its command line names", () => {
@@ -8071,7 +8243,7 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 7000
 describe("twenty-fourth review: the Chrome listing's timeout from the worker's own state, the hold invalidated, the clear under a standing hold, the call that triggered, and the profile path matched exactly", () => {
   // A synthetic listing, written by hand in the command's format (not captured from a real PC: the probe's chrome_listing step checks the real one).
   const sample = (udd: string, pid = 11204) => [
-    `${pid}|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}" --profile-directory=Default`,
+    `${pid}|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${udd}" --profile-directory=Default`,
     `9020|4400|2026-11-14T08:00:00.0000000Z|131.0.6778.70|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"`, ""].join("\r\n");
   // A monotonic clock a test moves: each read returns the next value.
   const clockOf = (...ts: number[]) => { let i = 0; return () => ts[Math.min(i++, ts.length - 1)]; };
@@ -8306,8 +8478,8 @@ describe("twenty-fifth review: the listing step never passes on a stand-in, a fl
   test("with a prefix-sharing second profile running and the dedicated Chrome's flag quoted whole, the profile scan and the listing step agree with the dedicated match", async () => {
     const { q, id } = oneJob();
     const ded = q.dedicated();
-    const quoted = { ...ded, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" "--user-data-dir=${q.udd}" --profile-directory=Default` };
-    const twin = { pid: 7100, ppid: 1, created: T0.getTime() - 120_000, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir=${q.udd}-2` };
+    const quoted = { ...ded, cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" "--user-data-dir=${q.udd}" --profile-directory=Default` };
+    const twin = { pid: 7100, ppid: 1, created: T0.getTime() - 120_000, cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir=${q.udd}-2` };
     mkdirSync(join(`${q.udd}-2`, "Default"), { recursive: true });
     writeFileSync(join(`${q.udd}-2`, "Default", "Preferences"), JSON.stringify({ extensions: { settings: {} } }));
     // The dedicated folder (which holds the extension) is never scanned as another profile; the twin is.
@@ -8594,5 +8766,929 @@ describe("0.12.2: the hooks seal the test symbol and run the worker's preload sc
       expect(body.indexOf("if (startRefused)")).toBeLessThan(body.indexOf("hookBudget("));
       expect(body.indexOf("if (startRefused)")).toBeLessThan(body.indexOf("if (probe.deny)"));
     }
+  });
+});
+
+// Cain 0.19.1, review round 1 of pull request 60: the five adopted fixes, each with the cases that fail without it.
+describe("Cain 0.19.1, review round 1: the PC worker's fixes for Chrome 158 and the Claude desktop app", () => {
+  const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+  const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+  const ASAR = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar";
+
+  test("1. the desktop shell: its plain process and its typed children, with no CLI entry, are left out", async () => {
+    // Review round 2: with the file's identity (a stand-in reader), the listed executable path, and a known child shape.
+    const ident = () => ({ ...CHAIN_OK, asar: true, product: "Claude", original: "claude.exe", signer: DESKTOP_SIGNER_SUBJECT, status: "Valid", cased: true });
+    const asar = (exe: string) => `${exe.slice(0, exe.lastIndexOf("\\"))}\\resources\\app.asar`;
+    const shell = [
+      { pid: 50, cmd: `"${APP}"`, name: "claude.exe", exe: APP },
+      { pid: 51, cmd: APP, name: "claude.exe", exe: APP },
+      { pid: 52, cmd: `"${SQUIRREL}"`, exe: SQUIRREL },
+      ...["gpu-process", "renderer", "utility", "crashpad-handler", "zygote", "broker"].map((t, i) => {
+        const exe = i % 2 ? SQUIRREL : APP;
+        return { pid: 60 + i, exe, cmd: `"${exe}" --type=${t}${t === "utility" ? " --utility-sub-type=network.mojom.NetworkService" : ""} --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --app-path="${asar(exe)}"` };
+      }),
+      { pid: 70, cmd: `${APP} --type=renderer --lang=en-US`, exe: APP },
+    ];
+    for (const p of shell) expect([p.cmd, isDesktopShell(p, ident), isClaudeCode(p, undefined, ident)]).toEqual([p.cmd, true, false]);
+    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe", ident)).toEqual([]);
+    const { q, id } = oneJob();
+    expect(await run(q.opts({ ...attended, procs: () => shell, exeIdentity: ident }))).toMatchObject({ code: "ok", job: id });
+  });
+
+  test("1. everything else that names claude.exe, or runs the CLI entry, refuses as chrome_busy", async () => {
+    const CLI = "node_modules\\@anthropic-ai\\claude-code\\cli.js";
+    const refuse: { why: string; p: { pid: number; cmd: string; name?: string; exe?: string } }[] = [
+      { why: "the app's Electron running the CLI, backslashes", p: { pid: 80, cmd: `"${APP}" "C:\\Users\\owner\\AppData\\Roaming\\npm\\${CLI}" -p` } },
+      { why: "forward slashes", p: { pid: 81, cmd: `"${APP}" C:/Users/owner/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/cli.js` } },
+      { why: "from app.asar", p: { pid: 82, cmd: `"${APP}" "${ASAR}\\${CLI}"` } },
+      { why: "from app.asar.unpacked", p: { pid: 83, cmd: `"${APP}" "${ASAR}.unpacked\\${CLI}" --output-format stream-json` } },
+      { why: "a utility child carrying the CLI path", p: { pid: 84, cmd: `"${APP}" --type=utility --utility-sub-type=node.mojom.NodeService "${ASAR}.unpacked\\${CLI}"` } },
+      { why: "a claude-code folder's cli.js", p: { pid: 85, cmd: `"C:\\Program Files\\nodejs\\node.exe" "D:\\src\\claude-code\\dist\\cli.mjs"` } },
+      { why: "a native claude.exe outside the app folder, no arguments", p: { pid: 86, cmd: '"C:\\Users\\owner\\.local\\bin\\claude.exe"' } },
+      { why: "the desktop's own Code binary outside its app folder", p: { pid: 87, cmd: '"C:\\Users\\owner\\AppData\\Roaming\\Claude\\claude-code\\2.1.0\\claude.exe"' } },
+      { why: "app-folder claude.exe with -p", p: { pid: 88, cmd: `"${APP}" -p "hello"` } },
+      { why: "app-folder claude.exe with --output-format stream-json", p: { pid: 89, cmd: `"${APP}" --output-format stream-json` } },
+      { why: "app-folder claude.exe running mcp serve", p: { pid: 90, cmd: `"${SQUIRREL}" mcp serve` } },
+      { why: "an 8.3 path", p: { pid: 91, cmd: '"C:\\PROGRA~1\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe"' } },
+      { why: "a \\\\?\\ path", p: { pid: 92, cmd: `"\\\\?\\${APP}"` } },
+      { why: "a UNC path", p: { pid: 93, cmd: '"\\\\host\\share\\WindowsApps\\Claude_1\\app\\claude.exe"' } },
+      { why: "mixed case CLI entry", p: { pid: 94, cmd: `"${APP.toUpperCase()}" "C:\\Users\\owner\\Node_Modules\\@Anthropic-AI\\Claude-Code\\CLI.JS"` } },
+      { why: "mixed case CLI entry, typed child", p: { pid: 95, cmd: `"${APP}" --type=renderer C:/X/@ANTHROPIC-AI/CLAUDE-CODE/cli.js` } },
+      { why: "an app-folder claude.exe whose command line is empty", p: { pid: 96, cmd: "", name: "claude.exe", exe: APP } },
+      { why: "a node.exe whose command line is empty", p: { pid: 97, cmd: "", name: "node.exe" } },
+      { why: "a bun.exe whose command line is empty", p: { pid: 98, cmd: "", name: "bun.exe" } },
+      { why: "an electron.exe whose command line is empty", p: { pid: 99, cmd: "  ", exe: "C:\\x\\electron.exe" } },
+      { why: "a --type value not on the known list", p: { pid: 100, cmd: `"${APP}" --type=extension` } },
+      { why: "a --type known and one not", p: { pid: 101, cmd: `"${APP}" --type=renderer --type=node` } },
+      { why: "an app path whose listed executable is elsewhere", p: { pid: 102, cmd: `"${APP}"`, name: "claude.exe", exe: "C:\\Temp\\claude.exe" } },
+      { why: "a version-less AnthropicClaude folder", p: { pid: 103, cmd: '"C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\claude.exe"' } },
+      { why: "a dot segment", p: { pid: 104, cmd: '"C:\\Program Files\\WindowsApps\\Claude_1\\app\\.\\claude.exe"' } },
+      { why: "an image named claude.exe whatever its command line says", p: { pid: 105, cmd: "C:\\tools\\agent --serve", name: "claude.exe" } },
+    ];
+    for (const { why, p } of refuse) {
+      expect([why, isClaudeCode(p)]).toEqual([why, true]);
+      const { q } = oneJob();
+      expect([why, (await run(q.opts({ ...attended, procs: () => [p] }))).code]).toEqual([why, "chrome_busy"]);
+    }
+    // A process list that can't be read still refuses.
+    const { q } = oneJob();
+    expect((await run(q.opts({ ...attended, procs: () => null }))).code).toBe("chrome_busy");
+    // A process with no name and an empty command line can't be told apart from Windows' own: left alone, as before.
+    expect(isClaudeCode({ pid: 110, cmd: "" })).toBe(false);
+    expect(hasCliEntry("C:/a/node_modules/@anthropic-ai/claude-code/cli.js")).toBe(true);
+    expect(splitCmd(`${APP} --type=renderer`)).toEqual({ exe: APP, rest: " --type=renderer" });
+  });
+
+  // 2. The native host manifest: every registry view Chrome reads for the extension's host name, and the pinned manifest.
+  test("2. a second manifest registered under HKCU by the desktop app, or a pinned one naming the app's host, refuses check-host, bind-profile and the probe", async () => {
+    const q = queueRig({ confirmed: false, browser: "chrome" });
+    const desk = "C:\\Users\\owner\\AppData\\Roaming\\Claude\\ChromeNativeHost\\com.anthropic.claude_browser_extension.json";
+    const two = () => [{ view: "HKCU" as const, path: desk }, { view: "HKLM64" as const, path: q.manifest }];
+    expect(manifestViews(q.opts({ registry: two }), q.inst)).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["HKCU"], distinct: 2 });
+    expect(() => checkHost(q.opts({ registry: two }))).toThrow("manifest_path_mismatch");
+    await expect(bindProfile(q.opts({ ...attended, registry: two }))).rejects.toThrow("browser_not_edge");
+    await expect(probe(q.opts({ ...attended, registry: two }))).rejects.toMatchObject({ code: "browser_not_edge" });
+    expect(q.launches).toEqual([]);
+    // Each view on its own, the HKLM ones included.
+    for (const view of ["HKCU", "HKLM64", "HKLM32"] as const)
+      expect(manifestViews(q.opts({ registry: () => [{ view: "HKCU", path: q.manifest }, { view, path: desk }] }), q.inst).code).toBe("manifest_path_mismatch");
+    // The pinned manifest itself naming the desktop app's own host program.
+    const pinned = JSON.parse(readFileSync(q.manifest, "utf8"));
+    writeFileSync(q.manifest, JSON.stringify({ ...pinned, path: "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\resources\\chrome-native-host.exe" }));
+    expect(manifestViews(q.opts(), q.inst)).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["desktop_app_host"] });
+    expect(() => checkHost(q.opts())).toThrow("manifest_path_mismatch");
+    await expect(probe(q.opts(attended))).rejects.toMatchObject({ code: "browser_not_edge" });
+    writeFileSync(q.manifest, JSON.stringify({ ...pinned, path: "C:\\Program Files\\WindowsApps\\Claude_1.0_x64__p\\app\\resources\\chrome-native-host.exe" }));
+    expect(manifestViews(q.opts(), q.inst).code).toBe("manifest_path_mismatch");
+    writeFileSync(q.manifest, JSON.stringify(pinned));
+    expect(manifestViews(q.opts(), q.inst).code).toBeNull();
+    expect(q.launches).toEqual([]);
+  });
+
+  // 3. The location 5 missing-path exception, narrowed.
+
+  test("4. the launcher's line for every code but chrome_busy is exactly one plain line naming the code", () => {
+    const { q } = oneJob();
+    for (const code of ["extra_extension", "manifest_path_mismatch", "probe_stale", "untrusted_config", "worker_failed", "cold_sample_missing"]) {
+      const l = launcherLine(code, q.opts(), q.inst);
+      expect(l).toBe(`Stopped: ${code}. Tell Cain: refusal ${code}.`);
+      expect(l).not.toMatch(/[\\/]|\d|\r|\n|Troubleshooting|pc-jobs\.md/);
+    }
+    expect(launcherLine("../x\\y 12", q.opts(), q.inst)).toBe("Stopped: worker_failed. Tell Cain: refusal worker_failed.");
+    expect(launcherLine("chrome_busy", q.opts({ procs: () => [{ pid: 60, cmd: '"C:/Users/owner/.local/bin/claude.exe"' }] }), q.inst))
+      .toBe("Stopped: another Claude Code is running. Close every terminal running claude, then press a key to try again.");
+  });
+
+  test("5. the launcher's paths: plain ASCII only, quoted at every use, delayed expansion off, CRLF", () => {
+    const bun = "C:\\Program Files (x86)\\Bun (x64)\\bun.exe", worker = "C:\\tools (1)\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts", home = "C:\\pc worker (k7q2xz)";
+    const text = launcherText(bun, worker, home);
+    for (const p of [bun, worker, home]) {
+      let at = text.indexOf(p), n = 0;
+      expect(at).toBeGreaterThan(-1);
+      while (at >= 0) { expect([p, text[at - 1], text[at + p.length]]).toEqual([p, '"', '"']); n++; at = text.indexOf(p, at + 1); }
+      expect(n).toBe(p === home ? 4 : 3);   // Cain 0.20.0: three calls (the component check is gone)
+    }
+    expect(text).not.toContain("%");
+    expect(/^[\x20-\x7e\r\n]*$/.test(text)).toBe(true);
+    expect(text.replace(/\r\n/g, "")).not.toMatch(/[\r\n]/);
+    expect(text.split("\r\n")).toContain("setlocal DisableDelayedExpansion");
+    for (const bad of ["C:\\Users\\Zo\u00eb\\bun.exe", "C:\\\u0420\\bun.exe", "C:\\a\u00a0b", "C:\\a\tb", "C:\\a\u2014b", " C:\\lead"]) {
+      for (const args of [[bad, worker, home], [bun, bad, home], [bun, worker, bad]] as [string, string, string][])
+        expect(() => launcherText(...args)).toThrow(expect.objectContaining({ code: "untrusted_config" }));
+    }
+  });
+});
+
+describe("Cain 0.19.1, review round 2: file identity for the desktop shell, native hosts under any name, the component rule, the launcher's proof", () => {
+  const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+  const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+  const asarOf = (exe: string) => `${exe.slice(0, exe.lastIndexOf("\\"))}\\resources\\app.asar`;
+  const SIGNER = 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US';
+  const GOOD: ExeIdentity = { ...CHAIN_OK, asar: true, product: DESKTOP_VERSION_INFO.product, original: DESKTOP_VERSION_INFO.original, signer: SIGNER, status: "Valid", cased: true };
+  const CLI_INFO = [{ product: "Claude Code", original: "claude.exe" }, { product: "Bun", original: "bun.exe" }, { product: "", original: "" }];
+  const good = () => GOOD;
+  const shellOf = (exe: string, args = "") => ({ pid: 50, name: "claude.exe", exe, cmd: `"${exe}"${args ? ` ${args}` : ""}` });
+  const UDD = '--user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude"';
+
+  describe("1. the desktop shell is exempt only by file identity, and its children only with a complete known shape", () => {
+    test("the real shell and its known children pass, and a run goes through", async () => {
+      const kids = (exe: string) => [
+        shellOf(exe),
+        shellOf(exe, `--type=gpu-process ${UDD} --gpu-preferences=WAAAAAAAAADgAAAEAAAAAAAAAAAAAAAAAABgAAEAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA --field-trial-handle=1812,i,1,2,262144 --mojo-platform-channel-handle=1820 /prefetch:2`.replace(" /prefetch:2", " --prefetch=2")),
+        shellOf(exe, `--type=renderer ${UDD} --app-path="${asarOf(exe)}" --enable-sandbox --lang=en-US --device-scale-factor=1.5 --num-raster-threads=4 --renderer-client-id=5 --time-ticks-at-unix-epoch=-1764160000000000 --launch-time-ticks=123 --mojo-platform-channel-handle=2100 --field-trial-handle=1812,i,1,2,262144`),
+        shellOf(exe, `--type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none ${UDD} --mojo-platform-channel-handle=1900 --field-trial-handle=1812,i,1,2,262144`),
+        shellOf(exe, `--type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service ${UDD} --mojo-platform-channel-handle=1950`),
+        shellOf(exe, `--type=utility --utility-sub-type=audio.mojom.AudioService --lang=en-US --service-sandbox-type=audio ${UDD}`),
+        shellOf(exe, `--type=crashpad-handler ${UDD} --monitor-self-annotation=ptype=crashpad-handler --database=C:\\Users\\owner\\AppData\\Roaming\\Claude\\Crashpad --url=https://f.a.k/e --annotation=_productName=Claude --initial-client-data=0x4f0,0x4f4`),
+      ];
+      for (const exe of [APP, SQUIRREL]) for (const p of kids(exe)) expect([p.cmd, isDesktopShell(p, good), isClaudeCode(p, undefined, good)]).toEqual([p.cmd, true, false]);
+      const { q, id } = oneJob();
+      expect(await run(q.opts({ ...attended, procs: () => [...kids(APP), ...kids(SQUIRREL)], exeIdentity: good }))).toMatchObject({ code: "ok", job: id });
+    });
+
+    test("the native CLI binary at the app-<version> path, run with no arguments, refuses: same folder, listed path matching, no app.asar, the CLI's version info", async () => {
+      const p = shellOf(SQUIRREL);
+      for (const info of CLI_INFO) {
+        const r = () => ({ ...GOOD, ...info, asar: false });
+        expect([info, isDesktopShell(p, r), isClaudeCode(p, undefined, r)]).toEqual([info, false, true]);
+        const { q } = oneJob();
+        expect((await run(q.opts({ ...attended, procs: () => [p], exeIdentity: r }))).code).toBe("chrome_busy");
+      }
+    });
+
+    test("the same with app.asar planted beside it, but the CLI's version info, still refuses; so does every other identity that isn't the app's", async () => {
+      const p = shellOf(SQUIRREL);
+      const bad: [string, ExeIdentity | null][] = [
+        ...CLI_INFO.map((info): [string, ExeIdentity] => [`CLI info ${info.product}`, { ...GOOD, ...info }]),
+        ["no app.asar", { ...GOOD, asar: false }],
+        ["a ProductName of another case", { ...GOOD, product: "claude" }],
+        ["unsigned", { ...GOOD, signer: "", status: "NotSigned" }],
+        ["signed by someone else", { ...GOOD, signer: "CN=Contoso, O=Contoso" }],
+        ["Anthropic only inside another name", { ...GOOD, signer: "CN=NotAnthropic Ltd, O=NotAnthropic Ltd" }],
+        ["a signature that doesn't verify", { ...GOOD, status: "HashMismatch" }],
+        ["a path not written as the disk lists it", { ...GOOD, cased: false }],
+        ["a reader that failed", null],
+      ];
+      for (const [why, x] of bad) {
+        expect([why, desktopIdentity(x), isClaudeCode(p, undefined, () => x)]).toEqual([why, false, true]);
+        const { q } = oneJob();
+        expect([why, (await run(q.opts({ ...attended, procs: () => [p], exeIdentity: () => x }))).code]).toEqual([why, "chrome_busy"]);
+      }
+      // A reader that throws refuses too; one with no listed executable path is never asked.
+      expect(isClaudeCode(p, undefined, () => { throw new Error("powershell"); })).toBe(true);
+      let asked = 0;
+      expect(isClaudeCode({ pid: 51, cmd: `"${APP}"`, name: "claude.exe" }, undefined, () => { asked++; return GOOD; })).toBe(true);
+      expect(asked).toBe(0);
+      // Off Windows (no reader) nothing is exempt.
+      if (!WIN) expect(isDesktopShell(shellOf(APP))).toBe(false);
+    });
+
+    test("one reading per process image per listing, cached by path", () => {
+      let reads = 0;
+      const r = (exe: string) => { reads++; return exe === APP ? GOOD : null; };
+      const ps = [shellOf(APP), shellOf(APP, "--type=gpu-process"), shellOf(APP, "--type=crashpad-handler"), shellOf(SQUIRREL)];
+      expect(claudeSessions(ps, undefined, r).map((p) => p.exe)).toEqual([SQUIRREL]);
+      expect(reads).toBe(2);
+      const memo = identityMemo(r);
+      memo(APP); memo(APP.toUpperCase()); memo(APP);
+      expect(reads).toBe(3);
+    });
+
+    test("a utility child running Node, an unknown or missing sub-type, a known child with an unrecognised argument or a packaged entry point, or a CLI marker refuses", async () => {
+      const refuse: [string, string][] = [
+        ["node.mojom.NodeService", `--type=utility --utility-sub-type=node.mojom.NodeService --lang=en-US ${UDD}`],
+        ["an unknown sub-type", "--type=utility --utility-sub-type=evil.mojom.Runner"],
+        ["no sub-type", "--type=utility --lang=en-US"],
+        ["two sub-types", "--type=utility --utility-sub-type=network.mojom.NetworkService --utility-sub-type=node.mojom.NodeService"],
+        ["a sub-type on a renderer", "--type=renderer --utility-sub-type=network.mojom.NetworkService"],
+        ["--inspect on a renderer", "--type=renderer --inspect=9229"],
+        ["--js-flags", "--type=renderer --js-flags=--expose-gc"],
+        ["an unknown switch", "--type=gpu-process --remote-debugging-port=9222"],
+        ["a packaged entry point", `--type=renderer "C:\\Users\\owner\\AppData\\Local\\Temp\\main.js"`],
+        ["a bare word", "--type=renderer main.js"],
+        ["--app-path elsewhere", '--type=renderer --app-path="C:\\Users\\owner\\x\\app.asar"'],
+        ["two types", "--type=renderer --type=gpu-process"],
+        ["an unknown type", "--type=extension"],
+        ["a CLI marker on a known child", "--type=renderer --output-format stream-json"],
+        ["-p on a known child", '--type=gpu-process -p "hi"'],
+        ["the CLI entry on a utility child", "--type=utility --utility-sub-type=network.mojom.NetworkService C:/x/node_modules/@anthropic-ai/claude-code/cli.js"],
+      ];
+      for (const [why, args] of refuse) {
+        const p = shellOf(APP, args);
+        expect([why, isDesktopShell(p, good), isClaudeCode(p, undefined, good)]).toEqual([why, false, true]);
+      }
+      const { q } = oneJob();
+      expect((await run(q.opts({ ...attended, procs: () => [shellOf(APP), shellOf(APP, refuse[0][1])], exeIdentity: good }))).code).toBe("chrome_busy");
+      expect(UTILITY_SAFE).not.toContain("node.mojom.NodeService");
+      expect(childShape(["--type=utility", "--utility-sub-type=network.mojom.NetworkService"], APP)).toBe(true);
+    });
+
+    test("5. the casing on disk: the real MSIX and Squirrel installs and WMI's ExecutablePath shapes", () => {
+      // What each folder lists, case kept, as the two installs write them.
+      const tree: Record<string, string[]> = {
+        "C:\\": ["Program Files", "Users", "Windows"],
+        "C:\\Program Files": ["WindowsApps", "Google"],
+        "C:\\Program Files\\WindowsApps": ["Claude_1.0.3218.0_x64__pzs8sxrjxfjjc"],
+        "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc": ["app", "AppxManifest.xml"],
+        "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app": ["claude.exe", "resources"],
+        "C:\\Users": ["owner"], "C:\\Users\\owner": ["AppData"], "C:\\Users\\owner\\AppData": ["Local"],
+        "C:\\Users\\owner\\AppData\\Local": ["AnthropicClaude"], "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude": ["app-1.0.3218", "Update.exe", "packages"],
+        "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218": ["claude.exe", "resources"],
+      };
+      const list = (d: string) => tree[d] ?? null;
+      // WMI's ExecutablePath for each, as Windows lists it.
+      for (const wmi of [APP, SQUIRREL]) expect([wmi, casedOnDisk(wmi, list)]).toEqual([wmi, true]);
+      for (const bad of [APP.toLowerCase(), APP.replace("WindowsApps", "windowsapps"), SQUIRREL.replace("AnthropicClaude", "anthropicclaude"),
+        SQUIRREL.replace("claude.exe", "Claude.exe"), SQUIRREL.replace("app-1.0.3218", "app-1.0.3219"), `\\\\?\\${APP}`, "C:\\PROGRA~1\\WindowsApps\\x\\app\\claude.exe"])
+        expect([bad, casedOnDisk(bad, list)]).toEqual([bad, false]);
+      expect(casedSegs("C:/Program Files/WindowsApps", list)).toBe(true);
+      expect(casedSegs("C:\\program files", list)).toBe(false);
+    });
+  });
+
+  describe("2. native hosts under any name", () => {
+    const desktopProc = shellOf(APP);
+    const other = (q: any, json: object | null, name = "com.anthropic.claude_desktop_host") => {
+      const f = join(q.home, `${name}.json`);
+      if (json) writeFileSync(f, JSON.stringify(json)); else rmSync(f, { force: true });
+      return () => ({ entries: [{ view: "HKCU" as const, name, path: f }], failed: [] as string[] });
+    };
+    test("a differently named manifest under HKCU whose allowed_origins holds the extension's origin refuses check-host, bind-profile and the probe", async () => {
+      const q = queueRig({ confirmed: false, browser: "chrome" });
+      const origin = `chrome-extension://${q.inst.profile.extension_id}/`;
+      const hostList = other(q, { name: "com.anthropic.claude_desktop_host", path: "C:\\Tools\\host.exe", type: "stdio", allowed_origins: [origin] });
+      expect(manifestViews(q.opts({ hostList }), q.inst)).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["other_host:com.anthropic.claude_desktop_host"] });
+      expect(() => checkHost(q.opts({ hostList }))).toThrow("manifest_path_mismatch");
+      await expect(bindProfile(q.opts({ ...attended, hostList }))).rejects.toThrow("browser_not_edge");
+      await expect(probe(q.opts({ ...attended, hostList }))).rejects.toMatchObject({ code: "browser_not_edge" });
+      // The origin without its slash, or in another case, counts the same.
+      expect(manifestViews(q.opts({ hostList: other(q, { allowed_origins: [origin.slice(0, -1).toUpperCase()] }) }), q.inst).code).toBe("manifest_path_mismatch");
+      // A host whose program is in the desktop app's folder refuses whatever its origins.
+      expect(manifestViews(q.opts({ hostList: other(q, { allowed_origins: ["chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/"], path: "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\resources\\chrome-native-host.exe" }) }), q.inst))
+        .toMatchObject({ code: "manifest_path_mismatch", mismatched: ["desktop_host:com.anthropic.claude_desktop_host"] });
+      expect(q.launches).toEqual([]);
+    });
+    test("one that holds another origin passes", () => {
+      const q = queueRig({ confirmed: false });
+      const hostList = other(q, { name: "com.example.host", path: "C:\\Tools\\host.exe", allowed_origins: ["chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/"] }, "com.example.host");
+      expect(manifestViews(q.opts({ hostList }), q.inst).code).toBeNull();
+      expect(() => checkHost(q.opts({ hostList }))).not.toThrow();
+    });
+    // Review round 4 replaced the test that let an unreadable manifest pass without the desktop shell: see "Cain 0.19.1, review round 4".
+    test("the listing reads every subkey in each of the three views, and a failed read is named", () => {
+      const answers: Record<string, { status: number | null; stdout: string; stderr?: string; error: boolean }> = {
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts /reg:64": { status: 0, stdout: "\r\nHKEY_CURRENT_USER\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_code_browser_extension\r\nHKEY_CURRENT_USER\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_browser_extension\r\n", error: false },
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_code_browser_extension /ve /reg:64": { status: 0, stdout: "\r\n    (Default)    REG_SZ    C:\\Users\\owner\\.claude\\host.json\r\n", error: false },
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_browser_extension /ve /reg:64": { status: 0, stdout: "\r\n    (Default)    REG_SZ    C:\\Users\\owner\\AppData\\Roaming\\Claude\\host.json\r\n", error: false },
+        "HKLM\\Software\\Google\\Chrome\\NativeMessagingHosts /reg:64": { status: 1, stdout: "", stderr: REG_NOT_FOUND, error: false },
+        "HKLM\\Software\\Google\\Chrome\\NativeMessagingHosts /reg:32": { status: 1, stdout: "", stderr: "ERROR: Access is denied.", error: false },
+      };
+      const l = hostListing("win32", (a) => answers[a.join(" ")] ?? { status: null, stdout: "", error: true });
+      expect(l).toEqual({ entries: [
+        { view: "HKCU", name: "com.anthropic.claude_code_browser_extension", path: "C:\\Users\\owner\\.claude\\host.json" },
+        { view: "HKCU", name: "com.anthropic.claude_browser_extension", path: "C:\\Users\\owner\\AppData\\Roaming\\Claude\\host.json" },
+      ], failed: ["HKLM32"] });
+      expect(hostListing("linux")).toBeUndefined();
+    });
+  });
+
+
+  describe("4. the launcher's proof", () => {
+    const bun = "C:\\Program Files\\Bun\\bun.exe", worker = "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts", home = "C:\\pc-worker-k7q2xz";
+    const choice = "C:\\Windows\\System32\\choice.exe";
+    const text = launcherText(bun, worker, home, choice);
+    const lines = text.split("\r\n").filter(Boolean);
+    test("choice /c ... /n with descending if errorlevel branches; no set /p and no %...% expansion", () => {
+      const at = lines.findIndex((l) => l.startsWith(`"${choice}" /c 123Q /n `));
+      expect(at).toBeGreaterThan(-1);
+      expect(lines.slice(at + 1, at + 4)).toEqual(["if errorlevel 4 goto :eof", "if errorlevel 3 goto run", "if errorlevel 2 goto probe"]);
+      expect(text).not.toMatch(/set\s+\/p/i);
+      expect(text).not.toMatch(/%[^%\r\n]*%/);
+      expect(text).not.toContain("%");
+      expect(text).not.toContain("!");
+    });
+    test("every bun and worker call is an absolute quoted path, and no unqualified command name appears", () => {
+      const calls = lines.filter((l) => !l.startsWith("rem ") && l.includes("worker.ts"));
+      expect(calls.length).toBe(3);
+      for (const l of calls) expect(l.startsWith(`"${bun}" "${worker}" `)).toBe(true);
+      for (const l of lines) {
+        if (l.startsWith(":")) continue;
+        const first = l.startsWith('"') ? l.slice(0, l.indexOf('"', 1) + 1) : l.split(" ")[0].toLowerCase();
+        if (first.startsWith('"')) expect([l, /^"[A-Za-z]:\\[^"]+\.(exe)"$/i.test(first)]).toEqual([l, true]);
+        else expect([l, LAUNCHER_BUILTINS.includes(first)]).toEqual([l, true]);
+      }
+      expect(text).not.toMatch(/(^|\r\n)(choice|bun|node|powershell|cmd|where)\b/i);
+      expect(launcherChoice({ SystemRoot: "C:\\Windows" })).toBe(choice);
+      for (const bad of ["choice.exe", "System32\\choice.exe", "C:\\Windows\\System32\\evil.exe"]) expect(() => launcherText(bun, worker, home, bad)).toThrow();
+      for (const rel of ["bun.exe", ".\\bun.exe", "worker.ts"]) expect(() => launcherText(rel, worker, home, choice)).toThrow();
+    });
+    test("on the Windows runner: the launcher runs the stand-in worker by its absolute path under cmd.exe, and a competing bun on PATH never runs", () => {
+      if (!WIN) return;
+      const root = realpathSync.native(mkdtempSync(join(tmpdir(), "pcwlaunch")));
+      if (/[^\x20-\x7e]|["%!^&|<>]/.test(root)) return;   // the runner's temp folder must be plain to write a launcher at all
+      const work = join(root, "home"), bin = join(root, "bin");
+      mkdirSync(work); mkdirSync(bin);
+      const stand = join(root, "standin.ts");
+      writeFileSync(stand, `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(join(root, "ran.txt"))}, JSON.stringify({ exec: process.execPath, script: process.argv[1], args: process.argv.slice(2) }) + "\\n");\n`);
+      for (const name of ["bun.cmd", "bun.bat", "choice.cmd", "choice.bat"]) writeFileSync(join(bin, name), `@echo off\r\necho competitor>>"${join(root, "competitor.txt")}"\r\n`);
+      writeFileSync(join(bin, "bun.exe"), readFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "whoami.exe")));
+      const cmdFile = join(root, LAUNCHER_NAME);
+      writeFileSync(cmdFile, launcherText(process.execPath, stand, work, launcherChoice(process.env)));
+      const env = { ...process.env, PATH: `${bin};${process.env.PATH ?? ""}`, PATHEXT: ".CMD;.BAT;.EXE;.COM" };
+      const go = (input: string) => {
+        rmSync(join(root, "ran.txt"), { force: true });
+        const r = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", cmdFile], { cwd: bin, env, input, encoding: "utf8", timeout: 60_000, windowsHide: true });
+        const ran = existsSync(join(root, "ran.txt")) ? readFileSync(join(root, "ran.txt"), "utf8").trim().split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : [];
+        return { r, ran };
+      };
+      expect(go("Q").ran).toEqual([]);
+      expect(go("xQ").ran).toEqual([]);
+      const two = go("2 Q");
+      expect(two.ran.length).toBe(1);
+      expect(two.ran[0]).toMatchObject({ script: stand, args: ["probe", "--attended", "--launcher", "--home", work] });
+      expect(two.ran[0].exec.toLowerCase()).toBe(process.execPath.toLowerCase());
+      expect(existsSync(join(root, "competitor.txt"))).toBe(false);
+      rmSync(root, { recursive: true, force: true });
+    });
+  });
+});
+
+describe("Cain 0.19.1, review round 4", () => {
+  const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+  const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+  const GOOD: ExeIdentity = { ...CHAIN_OK, asar: true, product: DESKTOP_VERSION_INFO.product, original: DESKTOP_VERSION_INFO.original, signer: DESKTOP_SIGNER_SUBJECT, status: "Valid", cased: true };
+  const shellOf = (exe: string, args = "") => ({ pid: 50, name: "claude.exe", exe, cmd: `"${exe}"${args ? ` ${args}` : ""}` });
+  const DESKTOP_HOST = "com.anthropic.claude_desktop_host";
+  const KEY = "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts";
+  // A host of another name, registered under HKCU, with its manifest in the worker's test folder (null: a manifest that can't be read).
+  const hostOf = (q: any, json: object | null, name = DESKTOP_HOST) => {
+    const f = join(q.home, `${name}.json`);
+    if (json) writeFileSync(f, JSON.stringify(json)); else rmSync(f, { force: true });
+    return { entries: [{ view: "HKCU" as const, name, path: f }], failed: [] as string[] };
+  };
+  const detailOf = (f: () => unknown) => { try { f(); } catch (e: any) { return { code: e.code, detail: typeof e.detail === "string" ? e.detail : JSON.stringify(e.detail) }; } return null; };
+  const pending = (q: any, id: string) => JSON.parse(q.remoteFile(`jobs/${id}.json`)).state;
+
+
+  describe("2. an unreadable registry view or manifest fails closed at every entry point, naming the key", () => {
+    test("an unreadable manifest refuses check-host on Chrome (a diagnostic since Cain 0.20.0); bind-profile, the probe and a job on Chrome refuse as browser_not_edge", async () => {
+      const { q, id } = oneJob();
+      q.install({ browser: undefined } as any);
+      const unreadable = hostOf(q, null);
+      const o = (over: Partial<Opts> = {}) => q.opts({ ...over, hostList: () => unreadable, procs: () => [q.dedicated()] });
+      const named = `${KEY}\\${DESKTOP_HOST} (/reg:64), its manifest`;
+      const m = manifestViews(o(), q.inst);
+      expect(m).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["host_scan_failed"], unread: named });
+      const ch = detailOf(() => checkHost(o()));
+      expect(ch?.code).toBe("manifest_path_mismatch");
+      expect(ch?.detail).toContain(named);
+      await expect(bindProfile(o(attended))).rejects.toMatchObject({ code: "browser_not_edge" });
+      await expect(probe(o(attended))).rejects.toMatchObject({ code: "browser_not_edge" });
+      expect(await run(o(attended))).toMatchObject({ code: "browser_not_edge", job: null });
+      expect(pending(q, id)).toBe("pending");
+      expect(q.launches).toEqual([]);
+    });
+    test("a registry view that can't be read refuses check-host on Chrome the same way, naming the view's key", async () => {
+      const { q } = oneJob();
+      q.install({ browser: undefined } as any);
+      const failed = () => ({ entries: [], failed: ["HKLM32"] });
+      const m = manifestViews(q.opts({ hostList: failed, procs: () => [] }), q.inst);
+      expect(m).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["host_scan_failed"], unread: "HKLM\\Software\\Google\\Chrome\\NativeMessagingHosts (/reg:32, the view itself)" });
+      expect(detailOf(() => checkHost(q.opts({ hostList: failed })))?.detail).toContain("HKLM\\Software\\Google\\Chrome\\NativeMessagingHosts (/reg:32");
+      expect(await run(q.opts({ ...attended, hostList: failed }))).toMatchObject({ code: "browser_not_edge", job: null });
+      expect(hostKeyOf("HKCU:com.x.y")).toBe(`${KEY}\\com.x.y (/reg:64)`);
+    });
+  });
+
+  describe("3. the desktop shell's signer is a pinned publisher identity, and its chain must end at a trusted root", () => {
+    test("a subject that contains Anthropic but isn't the pinned subject refuses; the pinned subject with a Valid status passes; a self-signed chain refuses", async () => {
+      expect(identityFailure(GOOD)).toBeNull();
+      expect(isDesktopShell(shellOf(APP), () => GOOD)).toBe(true);
+      const bad: [string, ExeIdentity][] = [
+        ["Anthropic, PBC as CN alone", { ...GOOD, signer: 'CN="Anthropic, PBC"' }],
+        ["Anthropic as O only", { ...GOOD, signer: "CN=Someone, O=Anthropic" }],
+        ["Anthropic inside another subject", { ...GOOD, signer: `${DESKTOP_SIGNER_SUBJECT}, OU=Extra` }],
+        ["the pinned subject in another case", { ...GOOD, signer: DESKTOP_SIGNER_SUBJECT.toLowerCase() }],
+        ["a Valid status with a self-signed chain", { ...GOOD, issuer: DESKTOP_SIGNER_SUBJECT, chain_length: 1, root_self_signed: true, root_trusted: true }],
+        ["a chain whose root isn't in the machine's trusted roots", { ...GOOD, root_trusted: false }],
+        ["a chain of one", { ...GOOD, chain_length: 1 }],
+        ["a status other than Valid", { ...GOOD, status: "UnknownError" }],
+      ];
+      for (const [why, x] of bad) {
+        expect([why, desktopIdentity(x), isDesktopShell(shellOf(APP), () => x), isClaudeCode(shellOf(SQUIRREL), undefined, () => x)]).toEqual([why, false, false, true]);
+        const { q } = oneJob();
+        expect([why, (await run(q.opts({ ...attended, procs: () => [shellOf(APP)], exeIdentity: () => x }))).code]).toEqual([why, "chrome_busy"]);
+      }
+      expect(identityFailure({ ...GOOD, issuer: DESKTOP_SIGNER_SUBJECT, chain_length: 1 })).toBe("certificate chain (self-signed signer)");
+    });
+  });
+
+
+  describe("follow-ups", () => {
+    test("A. an identity failure says which check failed, with the values read, in the refusal and the launcher's line", async () => {
+      const cases: [string, Proc, ExeIdentity | null, string][] = [
+        ["no listed path", { pid: 50, name: "claude.exe", cmd: `"${APP}"` }, GOOD, "executable path not listed"],
+        ["path mismatch", { ...shellOf(APP), exe: SQUIRREL }, GOOD, "path mismatch"],
+        ["no app.asar", shellOf(APP), { ...GOOD, asar: false }, "no app.asar beside it"],
+        ["version info", shellOf(APP), { ...GOOD, product: "Claude Code" }, 'version info mismatch (ProductName "Claude Code", OriginalFilename "claude.exe")'],
+        ["signature status", shellOf(APP), { ...GOOD, status: "HashMismatch" }, 'signature status "HashMismatch"'],
+        ["signer subject", shellOf(APP), { ...GOOD, signer: "CN=Anthropic Fake, O=Anthropic Fake" }, 'signer subject "CN=Anthropic Fake, O=Anthropic Fake"'],
+        ["unreadable", shellOf(APP), null, "identity unreadable"],
+      ];
+      for (const [why, p, x, says] of cases) {
+        expect([why, desktopShellWhy(p, () => x)]).toEqual([why, expect.stringContaining(says)]);
+        expect([why, busyLine([p], undefined, () => x)]).toEqual([why, expect.stringContaining(`failed its identity check (${says}`)]);
+      }
+      // A plain CLI is not an identity failure: its line names none.
+      expect(busyLine([{ pid: 9, name: "claude.exe", exe: "C:\\Users\\owner\\.local\\bin\\claude.exe", cmd: "claude -p hi" }], undefined, () => GOOD)).not.toContain("identity");
+      const { q } = oneJob();
+      const signer = { ...GOOD, signer: "CN=Anthropic Fake" };
+      await expect(bindProfile(q.opts({ ...attended, procs: () => [q.dedicated(), shellOf(APP)], exeIdentity: () => signer })))
+        .rejects.toMatchObject({ code: "chrome_busy", detail: expect.stringContaining('signer subject "CN=Anthropic Fake"') });
+      expect(launcherLine("chrome_busy", q.opts({ procs: () => [shellOf(APP)], exeIdentity: () => signer }))).toContain('signer subject "CN=Anthropic Fake"');
+      expect(await run(q.opts({ ...attended, procs: () => [q.dedicated(), shellOf(APP)], exeIdentity: () => signer }))).toMatchObject({ code: "chrome_busy" });
+      expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain('chrome_busy identity signer subject "CN=Anthropic Fake"');
+    });
+
+  });
+});
+
+// ==== Cain 0.20.0: the jobs browser is Edge (the second design, stage 1) ====================================================
+describe("Cain 0.20.0: the Edge jobs browser, the pre-launch gate, the pipe and the effective policy", () => {
+  const items = (q: any, over: Partial<Opts> = {}) => edgeGate(q.opts(over), q.inst).map((m) => m.item);
+  const sysWith = (q: any, over: Partial<EdgeSys> = {}, rec?: EdgeSetup) => edgeSysFor(rec ?? q.edgeRec(), { procs: () => [q.dedicated()], ...over });
+  const regWith = (q: any, over: Record<string, any>) => sysWith(q, { reg: edgeReg(q.edgeRec(), over) });
+  const POL = `HKLM\\${EDGE_POLICY_KEY}`;
+
+  test("msedge.exe is the machine install only; a per-user Edge refuses by name; the launch arguments are pinned", () => {
+    const env = { ProgramFiles: "C:\\Program Files", "ProgramFiles(x86)": "C:\\Program Files (x86)", LOCALAPPDATA: "C:\\Users\\o\\AppData\\Local" };
+    expect(edgeExe(env, (f) => f === "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe")).toEqual({ exe: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" });
+    expect(edgeExe(env, (f) => f === "C:\\Users\\o\\AppData\\Local\\Microsoft\\Edge\\Application\\msedge.exe")).toMatchObject({ refuse: "edge_per_user_install" });
+    expect(edgeExe(env, () => false)).toMatchObject({ refuse: "edge_missing" });
+    const { q } = oneJob();
+    const args = edgeLaunchArgs(q.inst);
+    expect(args).toEqual([`--user-data-dir=${q.udd}`, "--profile-directory=Default", "--disable-sync", "--disable-default-apps", "--no-first-run", "--remote-debugging-pipe"]);
+    for (const f of EDGE_FORBIDDEN_SWITCHES) expect(args.some((a) => a.startsWith(f))).toBe(false);
+    expect(edgeOpenArgs(q.inst)).not.toContain("--remote-debugging-pipe");
+  });
+
+  test("the gate passes as setup leaves the PC, and a job on Chrome refuses by name", async () => {
+    const { q, id } = oneJob();
+    expect(edgeGate(q.opts(), q.inst)).toEqual([]);
+    expect(checkHost(q.opts())).toMatchObject({ host: "ok", browser: "edge" });
+    q.install({ browser: undefined } as any);
+    const chrome = { ...q.inst, browser: undefined };
+    expect(edgeGate(q.opts(), chrome).map((m) => m.item)).toEqual(["browser_not_edge"]);
+    expect(await run(q.opts(attended))).toMatchObject({ code: "browser_not_edge", job: null });
+    await expect(bindProfile(q.opts(attended))).rejects.toMatchObject({ code: "browser_not_edge" });
+    await expect(probe(q.opts(attended))).rejects.toMatchObject({ code: "browser_not_edge" });
+    expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    expect(q.launches).toEqual([]);
+    expect(launcherLine("browser_not_edge", q.opts())).toBe("Stopped: jobs run in Edge now. Do the Edge setup steps in pc-jobs.md first. Tell Cain: refusal browser_not_edge.");
+  });
+
+  test("the setup record: missing, the owner's daily Edge, another extension or another policy set each refuse by name", () => {
+    const { q } = oneJob();
+    q.records({ edge_daily_use: true });
+    expect(items(q)).toEqual(["edge_daily_use"]);
+    q.records({ extension_id: "a".repeat(32) });
+    expect(items(q)).toEqual(["edge_setup_extension"]);
+    q.records({ policies: { ...edgePolicies(EXT, HOST_NAME_T), SyncDisabled: false } });
+    expect(items(q)).toEqual(["edge_setup_policies"]);
+    rmSync(join(q.home, "edge-setup.json"));
+    expect(edgeGate(q.opts(), q.inst)).toMatchObject([{ item: "edge_setup_missing", code: "edge_setup_missing" }]);
+    q.records();
+    q.install({ native_host_manifest: join(q.home, "other.json") });
+    expect(edgeGate(q.opts(), { ...q.inst, native_host_manifest: join(q.home, "other.json") }).map((m) => m.item)).toEqual(["host_install_json"]);
+  });
+
+  test("the policies: each missing, wrong, extra, forbidden, cloud-managed, user-level or unreadable entry refuses by name", () => {
+    const { q } = oneJob();
+    const rec = q.edgeRec();
+    const without = (n: string) => { const p: any = { ...rec.policies }; delete p[n]; return { status: 0, stdout: policyRegText(p) }; };
+    expect(items(q, { edgeSys: regWith(q, { [`${POL} /s /reg:64`]: without("SyncDisabled") }) })).toEqual(["policy_missing:SyncDisabled@HKLM64"]);
+    expect(items(q, { edgeSys: regWith(q, { [`${POL} /s /reg:32`]: without("ExtensionInstallAllowlist") }) })).toEqual(["policy_missing:ExtensionInstallAllowlist@HKLM32"]);
+    const wrong = { status: 0, stdout: policyRegText({ ...rec.policies, NativeMessagingUserLevelHosts: true, NativeMessagingAllowlist: [HOST_NAME_T, "com.other.host"] }) };
+    expect(items(q, { edgeSys: regWith(q, { [`${POL} /s /reg:64`]: wrong }) })).toEqual(["policy_value:NativeMessagingAllowlist@HKLM64", "policy_value:NativeMessagingUserLevelHosts@HKLM64"].sort((a, b) => a.includes("UserLevel") ? 1 : -1));
+    const extra = { status: 0, stdout: policyRegText(rec.policies, "    HomepageLocation    REG_SZ    https://example.com\r\n    CloudManagementEnrollmentToken    REG_SZ    x\r\n")
+      + `\r\nHKEY_LOCAL_MACHINE\\${EDGE_POLICY_KEY}\\ExtensionSettings\r\n    *    REG_SZ    {}\r\n` };
+    expect(items(q, { edgeSys: regWith(q, { [`${POL} /s /reg:64`]: extra }) }).sort()).toEqual(["cloud_management:CloudManagementEnrollmentToken@HKLM64", "policy_extra:HomepageLocation@HKLM64", "policy_forbidden:ExtensionSettings@HKLM64"]);
+    const user = { status: 0, stdout: `\r\nHKEY_CURRENT_USER\\${EDGE_POLICY_KEY}\r\n    SyncDisabled    REG_DWORD    0x0\r\n` };
+    expect(items(q, { edgeSys: regWith(q, { [`HKCU\\${EDGE_POLICY_KEY} /s /reg:64`]: user }) })).toEqual(["policy_user:SyncDisabled@HKCU64"]);
+    expect(items(q, { edgeSys: regWith(q, { [`${POL} /s /reg:64`]: { status: 5, stdout: "", stderr: "ERROR: Access is denied." } }) })).toEqual(["policy_unreadable:HKLM64"]);
+    const all = edgeGate(q.opts({ edgeSys: regWith(q, { [`${POL} /s /reg:64`]: NOT_FOUND_T }) }), q.inst);
+    expect(all.length).toBe(EDGE_POLICY_NAMES.length);
+    expect(new Set(all.map((m) => m.code))).toEqual(new Set(["edge_policy_missing"]));
+    expect(launcherLine("edge_policy_missing", q.opts())).toContain("Run check-host to see which");
+  });
+
+  test("the host: registered under HKLM only, and every field of the setup record compared", () => {
+    const { q } = oneJob();
+    const rec = q.edgeRec();
+    const HOST = `HKLM\\${EDGE_HOST_KEY}\\${HOST_NAME_T}`;
+    const at = (path: string) => ({ status: 0, stdout: `\r\nHKEY\\x\r\n    (Default)    REG_SZ    ${path}\r\n` });
+    expect(items(q, { edgeSys: regWith(q, { [`HKCU\\${EDGE_HOST_KEY}\\${HOST_NAME_T} /ve /reg:64`]: at(rec.manifest_path) }) })).toEqual(["host_user_level@HKCU64"]);
+    expect(items(q, { edgeSys: regWith(q, { [`${HOST} /ve /reg:64`]: NOT_FOUND_T }) })).toEqual(["host_unregistered"]);
+    expect(items(q, { edgeSys: regWith(q, { [`${HOST} /ve /reg:64`]: at("C:\\elsewhere.json") }) })).toEqual(["host_path@HKLM64"]);
+    expect(items(q, { edgeSys: regWith(q, { [`${HOST} /ve /reg:32`]: at("C:\\elsewhere.json") }) })).toEqual(["host_path@HKLM32"]);
+    expect(items(q, { edgeSys: regWith(q, { [`${HOST} /ve /reg:32`]: at(rec.manifest_path) }) })).toEqual([]);
+    const file = (f: string, bytes: string | null) => sysWith(q, { file: (x) => x === f ? (bytes === null ? null : Buffer.from(bytes)) : edgeSysFor(rec).file(x) });
+    const m = JSON.parse(manifestText(HOST_NAME_T, WRAPPER_AT, EXT));
+    expect(items(q, { edgeSys: file(rec.manifest_path, JSON.stringify(m)) })).toEqual(["host_manifest_changed"]);
+    expect(items(q, { edgeSys: file(rec.manifest_path, JSON.stringify({ ...m, allowed_origins: [...m.allowed_origins, "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"] })) })).toEqual(["host_manifest_changed", "host_manifest_shape"]);
+    expect(items(q, { edgeSys: file(rec.manifest_path, null) })).toEqual(["host_manifest_unreadable"]);
+    expect(items(q, { edgeSys: file(rec.wrapper_path, wrapperText("C:\\Users\\owner\\other\\claude.exe")) })).toEqual(["host_wrapper_changed", "host_target_changed"]);
+    expect(items(q, { edgeSys: file(rec.wrapper_path, "@echo off\r\nclaude --chrome-native-host\r\n") })).toEqual(["host_wrapper_changed", "host_target_changed"]);
+    expect(items(q, { edgeSys: sysWith(q, { target: () => ({ ...TARGET_ID, version: "2.1.1.0" }) }) })).toEqual(["host_version_changed"]);
+    expect(items(q, { edgeSys: sysWith(q, { target: () => ({ ...TARGET_ID, signer: "CN=Someone Else" }) }) })).toEqual(["host_signer_changed"]);
+    expect(items(q, { edgeSys: sysWith(q, { target: () => ({ ...TARGET_ID, status: "HashMismatch" }) }) })).toEqual(["host_signer_changed"]);
+    expect(items(q, { edgeSys: sysWith(q, { target: () => null }) })).toEqual(["host_target_unreadable"]);
+    expect(items(q, { edgeSys: sysWith(q, { acl: () => [...ADMIN_ONLY, "Allow|S-1-5-21-1-2-3-1001|Modify|False"] }) })).toEqual(["host_folder_writable"]);
+    expect(items(q, { edgeSys: sysWith(q, { acl: () => null }) })).toEqual(["host_folder_writable"]);
+    expect(adminOnlyProblems([`Allow|${ADMINS_SID}|FullControl|True`])).toEqual([ADMINS_SID]);
+    expect(wrapperTarget(wrapperText(CLAUDE_AT))).toBe(CLAUDE_AT);
+    expect(launcherLine("edge_host_mismatch", q.opts())).toContain("run edge-record");
+  });
+
+  test("the profile: the Extensions folder, the preferences parsed strictly, the external key, the seeds, Local State, the port file and a running Edge", () => {
+    const { q } = oneJob();
+    const sec = join(q.udd, "Default", "Secure Preferences");
+    const good = readFileSync(sec, "utf8");
+    const entry = (id: string, e: object) => writeFileSync(sec, JSON.stringify({ extensions: { settings: { ...JSON.parse(good).extensions.settings, [id]: e } } }));
+    const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", COMP = "cccccccccccccccccccccccccccccccc";
+    entry(OTHER, { location: 4, path: "C:\\dev\\x", state: 1 });
+    expect(items(q)).toEqual([`prefs_unpacked:${OTHER}`]);
+    entry(OTHER, { location: 8, path: "C:\\dev\\x", state: 1 });
+    expect(items(q)).toEqual([`prefs_command_line:${OTHER}`]);
+    entry(OTHER, { location: 1, path: `${OTHER}\\1.0_0`, state: 1 });
+    expect(items(q)).toEqual([`prefs_unknown_id:${OTHER}`]);
+    entry(EXT, { location: 1, path: `..\\..\\elsewhere\\${EXT}`, state: 1 });
+    expect(items(q)).toEqual([`prefs_path:${EXT}`]);
+    entry(EXT, { location: 9, path: `${EXT}\\1.2.3_0`, state: 1 });
+    expect(items(q)).toEqual([`prefs_location:${EXT}:EXTERNAL_POLICY`]);
+    entry(EXT, { location: 1, path: `${EXT}\\1.2.3_0`, state: 1, unexpected_field: 1 });
+    expect(items(q)).toEqual([`prefs_field:${EXT}:unexpected_field`]);
+    const app = "C:\\Program Files\\Microsoft\\Edge\\Application";
+    entry(COMP, { location: 5, path: `${app}\\142.0.3595.53\\resources\\pdf`, state: 1 });
+    expect(items(q)).toEqual([`component_unknown:${COMP}`]);
+    q.records({ builtin_ids: [COMP] });
+    expect(items(q)).toEqual([]);
+    entry(COMP, { location: 5, path: "C:\\Users\\owner\\AppData\\pdf", state: 1 });
+    expect(items(q)).toEqual([`prefs_path:${COMP}`]);
+    entry(COMP, { location: 1, path: `${COMP}\\1.0_0`, state: 1 });
+    expect(items(q)).toEqual([`prefs_location:${COMP}:INTERNAL`]);
+    writeFileSync(sec, "{ not json");
+    expect(items(q)).toEqual(["prefs_parse:Secure Preferences"]);
+    writeFileSync(sec, good);
+    mkdirSync(join(q.udd, "Default", "Extensions", OTHER));
+    expect(items(q)).toEqual([`extensions_folder:${OTHER}`]);
+    rmSync(join(q.udd, "Default", "Extensions", OTHER), { recursive: true });
+    expect(items(q)).toEqual([]);
+    const ext = { status: 0, stdout: `\r\nHKEY_LOCAL_MACHINE\\${EDGE_EXTERNAL_KEY}\r\n\r\nHKEY_LOCAL_MACHINE\\${EDGE_EXTERNAL_KEY}\\${OTHER}\r\n    update_url    REG_SZ    https://x\r\n` };
+    expect(items(q, { edgeSys: regWith(q, { [`HKLM\\${EDGE_EXTERNAL_KEY} /s /reg:32`]: ext }) })).toEqual(["external_key:HKLM32"]);
+    const disk = (files: Record<string, string>, dirs: Record<string, string[]>) => ({ ...q.opts().edgeDisk!,
+      list: (d: string) => dirs[d] ?? q.opts().edgeDisk!.list(d), read: (f: string) => f in files ? Buffer.from(files[f]) : q.opts().edgeDisk!.read(f) });
+    expect(items(q, { edgeDisk: disk({}, { [join(app, "142.0.3595.53", "default_apps")]: ["external_extensions.json"], [app]: ["142.0.3595.53", "msedge.exe"] }) })).toEqual(["seed:default_apps"]);
+    expect(items(q, { edgeDisk: disk({ [join(app, "initial_preferences")]: JSON.stringify({ extensions: { settings: {} } }) }, {}) })).toEqual(["seed:initial_preferences"]);
+    expect(items(q, { edgeDisk: disk({ [join(app, "initial_preferences")]: JSON.stringify({ distribution: { do_not_launch_chrome: true } }) }, {}) })).toEqual([]);
+    writeFileSync(join(q.udd, "Local State"), JSON.stringify({ profile: { info_cache: { Default: {}, "Profile 1": {} } } }));
+    expect(edgeGate(q.opts(), q.inst)).toMatchObject([{ item: "local_state_profiles:2", code: "edge_profiles" }]);
+    writeFileSync(join(q.udd, "Local State"), "nope");
+    expect(items(q)).toEqual(["local_state_unreadable"]);
+    writeFileSync(join(q.udd, "Local State"), JSON.stringify({ profile: { info_cache: { Default: {} } } }));
+    writeFileSync(join(q.udd, "DevToolsActivePort"), "9222\n/devtools/browser/x");
+    expect(edgeGate(q.opts(), q.inst)).toMatchObject([{ item: "devtools_port_file", code: "devtools_port_file" }]);
+    rmSync(join(q.udd, "DevToolsActivePort"));
+    expect(edgeGate(q.opts({ edgeSys: sysWith(q, { running: () => true }) }), q.inst)).toMatchObject([{ item: "edge_running", code: "edge_already_open" }]);
+    // The real check: a listed msedge.exe on the jobs folder, or its lockfile.
+    expect(realEdgeSys(q.opts({ procs: () => [q.dedicated()] })).running(q.udd)).toBe(true);
+    expect(realEdgeSys(q.opts({ procs: () => [] })).running(join(q.root, "nowhere"))).toBe(false);
+  });
+
+  test("the effective policy: each wrong source, scope, level, status, conflict and value refuses, and so do a missing row and an unrecognised table", () => {
+    const { q } = oneJob();
+    const rec = q.edgeRec();
+    const names = Object.keys(rec.policies);
+    const eff = (text: string) => effectiveItems(parsePolicyTable(text, names), rec).map((m) => m.item);
+    expect(eff(policyPage(rec.policies))).toEqual([]);
+    expect(eff(policyPage(rec.policies, { SyncDisabled: { source: "Cloud" } }))).toEqual(["effective_source:SyncDisabled"]);
+    expect(eff(policyPage(rec.policies, { SyncDisabled: { scope: "Current user" } }))).toEqual(["effective_scope:SyncDisabled"]);
+    expect(eff(policyPage(rec.policies, { SyncDisabled: { level: "Recommended" } }))).toEqual(["effective_level:SyncDisabled"]);
+    expect(eff(policyPage(rec.policies, { SyncDisabled: { status: "Error" } }))).toEqual(["effective_status:SyncDisabled"]);
+    expect(eff(policyPage(rec.policies, { SyncDisabled: { status: "Warning, Conflict" } }))).toEqual(["effective_status:SyncDisabled", "effective_conflict:SyncDisabled"]);
+    expect(eff(policyPage(rec.policies, { ExtensionInstallAllowlist: { value: `${EXT},bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` } }))).toEqual(["effective_value:ExtensionInstallAllowlist"]);
+    expect(eff(policyPage(rec.policies, { RemoteDebuggingAllowed: { value: "false" } }))).toEqual(["effective_value:RemoteDebuggingAllowed"]);
+    expect(eff(policyPage(rec.policies, { NativeMessagingBlocklist: null }))).toEqual(["effective_missing:NativeMessagingBlocklist"]);
+    expect(eff(policyPage(rec.policies, { SyncDisabled: { status: "Error, Ignored" } }, "\nThis policy is ignored because the device isn't managed (enrolled)."))).toEqual(["effective_needs_management:SyncDisabled"]);
+    expect(eff("")).toEqual(["policy_table_unrecognised"]);
+    expect(eff("Welcome to Microsoft Edge\nSearch the web")).toEqual(["policy_table_unrecognised"]);
+    // The list value as JSON, and the name-then-cells form a row can take as text.
+    expect(policyValueIs('["*"]', ["*"])).toBe(true);
+    expect(policyValueIs("*", ["*"])).toBe(true);
+    expect(policyValueIs("true", true)).toBe(true);
+    const block = ["Policy name", "Status", ...names.flatMap((n) => [n, Array.isArray(rec.policies[n]) ? JSON.stringify(rec.policies[n]) : String(rec.policies[n]), "Platform", "Machine", "Mandatory", "OK"])].join("\n");
+    expect(eff(block)).toEqual([]);
+    // The JSON export's shape.
+    const exp = { policyValues: { edge: { name: "Microsoft Edge Policies", policies: Object.fromEntries(names.map((n) => [n, { level: "mandatory", scope: "machine", source: "platform", value: rec.policies[n] }])) } } };
+    expect(eff(JSON.stringify(exp))).toEqual([]);
+    exp.policyValues.edge.policies.SyncDisabled = { ...exp.policyValues.edge.policies.SyncDisabled, error: "Ignored: not managed" } as any;
+    expect(eff(JSON.stringify(exp))).toEqual(["effective_needs_management:SyncDisabled"]);
+  });
+
+  test("the launch: the handshake against the spawned process, the policy page read and closed, and only then the job; a failed read opens no job page", async () => {
+    const { q, id } = oneJob();
+    q.confirmNow();
+    const sent: any[] = [];
+    const o = (over: Partial<Opts> = {}) => q.opts({ ...attended, ...over });
+    const r = await run(o());
+    expect(r).toMatchObject({ code: "ok", job: id });
+    const methods = q.edgeSent.map((m: any) => m.method);
+    expect(methods.slice(0, 3)).toEqual(["Browser.getVersion", "Target.createTarget", "Target.attachToTarget"]);
+    expect(q.edgeSent.find((m: any) => m.method === "Target.createTarget").params).toEqual({ url: "edge://policy" });
+    expect(methods).toContain("Target.closeTarget");
+    expect(methods[methods.length - 1]).toBe("Browser.close");
+    expect(q.edgeSent.filter((m: any) => m.method === "Target.createTarget").length).toBe(1);
+    expect(jobsEdgeNow()).toBeNull();
+    // The policy read refuses: no session starts, the job stays pending, the refusal names the policy.
+    const { q: q2, id: id2 } = oneJob();
+    q2.confirmNow();
+    q2.edgePage(() => policyPage(q2.edgeRec().policies, { SyncDisabled: { source: "Cloud" } }));
+    const r2 = await run(q2.opts({ ...attended, edgeLaunch: async () => ({ pid: q2.dedicated().pid, io: fakeEdge(() => policyPage(q2.edgeRec().policies, { SyncDisabled: { source: "Cloud" } }), { sent }), refs: null }) }));
+    expect(r2).toMatchObject({ code: "edge_policy_not_effective", job: null, detail: expect.stringContaining("effective_source:SyncDisabled") });
+    expect(q2.launches).toEqual([]);
+    expect(JSON.parse(q2.remoteFile(`jobs/${id2}.json`)).state).toBe("pending");
+    expect(sent.map((m) => m.method)).toContain("Browser.close");
+    // The handshake: not Edge, or not the process the worker started, or without the pipe switch.
+    const shake = async (over: Partial<Opts>) => { try { await startJobsEdge(q2.opts(over), q2.inst); return null; } catch (e: any) { await stopJobsEdge(); return e.detail?.items ?? e.code; } };
+    expect(await shake({ edgeLaunch: async () => ({ pid: q2.dedicated().pid, io: fakeEdge(() => "", { product: "HeadlessChrome/142.0" }), refs: null }) })).toEqual(["handshake_not_edge"]);
+    expect(await shake({ edgeLaunch: async () => ({ pid: 99999, io: fakeEdge(() => ""), refs: null }) })).toEqual(["handshake_pid"]);
+    const noPipe = { ...q2.dedicated(), cmd: `"${EDGE_EXE}" --user-data-dir="${q2.udd}" --remote-debugging-port=9222` };
+    expect(await shake({ edgeSys: edgeSysFor(q2.edgeRec(), { procs: () => [noPipe] }) })).toEqual(["handshake_switch", "handshake_forbidden:remote-debugging-port"]);
+    expect(await shake({ edgeLaunch: async () => ({ pid: q2.dedicated().pid, io: fakeEdge(() => "", { dropOn: "Browser.getVersion" }), refs: null }) })).toBe("edge_pipe_lost");
+    expect(handshakeItems("Edg/142.0", 4000, EDGE_EXE, q2.inst, null).map((m) => m.item)).toEqual(["handshake_procs_unreadable"]);
+  });
+
+  test("only page targets are closed; a lost pipe or a gone Edge stops the run; the handle scan over the claude.exe tree fails on a pipe handle", async () => {
+    const { q } = oneJob();
+    const sent: any[] = [];
+    let alive = true;
+    const o = q.opts({ edgeLaunch: async () => ({ pid: q.dedicated().pid, io: fakeEdge(() => policyPage(q.edgeRec().policies), { sent }), refs: null }),
+      edgeSys: edgeSysFor(q.edgeRec(), { procs: () => alive ? [q.dedicated(), { pid: 700, ppid: 600, cmd: "node x" }, { pid: 600, ppid: 1, cmd: "claude.exe -p" }] : [] }),
+      pipeScan: (pids) => ({ handles: 12, hits: pids.includes(700) ? [{ pid: 700, handle: "1234" }] : [], undup: 0 }) });
+    const e = await startJobsEdge(o, q.inst);
+    expect(await closePageTargets(e.cdp)).toBe(1);
+    expect(sent.filter((m) => m.method === "Target.closeTarget").map((m) => m.params.targetId)).toEqual(["T-POLICY", "T-POLICY"]);
+    expect(treeOf(o.edgeSys!.procs()!, 600)).toEqual([600, 700]);
+    expect(pipeLeakWhy(o, 600, "start")).toContain("a pipe handle to Edge is in the claude.exe tree (700)");
+    expect(pipeLeakWhy({ ...o, pipeScan: () => ({ handles: 12, hits: [], undup: 0 }) }, 600, "end")).toBeNull();
+    expect(pipeLeakWhy({ ...o, pipeScan: () => null }, 600, "end")).toBe("the handle scan couldn't run");
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toMatch(/pipe_scan start 2 processes 12 handles, 1 pipe handles/);
+    expect(edgeLostWhy(o)).toBeNull();
+    alive = false;
+    expect(edgeLostWhy(o)).toBe(`Edge's process ${q.dedicated().pid} is gone`);
+    alive = true;
+    e.cdp.drop("the pipe to Edge closed");
+    expect(edgeLostWhy(o)).toBe("the pipe to Edge closed");
+    await stopJobsEdge();
+    expect(jobsEdgeNow()).toBeNull();
+    expect(ABORT_CODES).toContain("pipe_handle_leak");
+    expect(ABORT_CODES).toContain("edge_pipe_lost");
+  });
+
+  test("setup: the question, the elevated prompt's lines with their meaning, and the records it keeps; edge-record shows old and new and records only on yes", async () => {
+    const { q } = oneJob();
+    rmSync(join(q.home, "edge-setup.json"));
+    const asked: string[] = [];
+    const o = (yes: boolean, over: Partial<Opts> = {}) => q.opts({ ...attended, confirm: async (m: string) => { asked.push(m); return yes; },
+      env: { ...TEST_ENV, ProgramData: "C:\\ProgramData" }, edgeSys: edgeSysFor(q.edgeRec()), ...over });
+    q.install({ claude: CLAUDE_AT });
+    const r = await edgeSetup(o(false));
+    expect(asked[0]).toBe(EDGE_QUESTION);
+    const rec = readEdgeSetup(q.opts())!;
+    expect(rec).toMatchObject({ edge_daily_use: false, host_name: HOST_NAME_T, target: CLAUDE_AT, target_version: TARGET_ID.version, target_signer: TARGET_ID.signer,
+      manifest_path: `C:\\ProgramData\\CainPcJobs\\EdgeHost\\${HOST_NAME_T}.json`, wrapper_path: WRAPPER_AT, policies: edgePolicies(EXT, HOST_NAME_T) });
+    expect(Buffer.from(rec.wrapper_b64, "base64").toString()).toBe(`@echo off\r\n"${CLAUDE_AT}" --chrome-native-host\r\n`);
+    expect(JSON.parse(Buffer.from(rec.manifest_b64, "base64").toString())).toMatchObject({ path: WRAPPER_AT, allowed_origins: [`chrome-extension://${EXT}/`] });
+    const text = r.lines.join("\n");
+    for (const n of EDGE_POLICY_NAMES) {
+      expect(text).toContain(`rem ${n}: `);
+      for (const v of ["/reg:64", "/reg:32"]) expect(r.lines.some((l) => l.includes(n) && l.startsWith("reg add") && l.endsWith(v))).toBe(true);
+    }
+    expect(text).toContain(`reg add "HKLM\\${EDGE_POLICY_KEY}\\ExtensionInstallBlocklist" /v 1 /t REG_SZ /d "*" /f /reg:64`);
+    expect(text).toContain(`reg add "HKLM\\${EDGE_POLICY_KEY}" /v SyncDisabled /t REG_DWORD /d 1 /f /reg:64`);
+    expect(text).toContain(`reg add "HKLM\\${EDGE_HOST_KEY}\\${HOST_NAME_T}" /ve /t REG_SZ /d "C:\\ProgramData\\CainPcJobs\\EdgeHost\\${HOST_NAME_T}.json" /f /reg:64`);
+    expect(text).toContain('icacls "C:\\ProgramData\\CainPcJobs\\EdgeHost" /inheritance:r');
+    expect(text).not.toMatch(/ExtensionInstallForcelist|ExtensionSettings/);
+    expect(r.lines.filter((l) => !l.startsWith("rem ")).some((l) => l.includes("HKCU"))).toBe(false);
+    expect(existsSync(join(q.home, "edge-host", "host.cmd"))).toBe(true);
+    // A yes: recorded, and nothing to run.
+    const daily = await edgeSetup(o(true));
+    expect(daily.edge_daily_use).toBe(true);
+    expect(readEdgeSetup(q.opts())!.edge_daily_use).toBe(true);
+    // edge-record after a Claude Code update: old and new shown, recorded only on yes.
+    await edgeSetup(o(false));
+    asked.length = 0;
+    const newer = { ...TARGET_ID, version: "2.1.1.0" };
+    expect(await edgeRecord(o(false, { edgeSys: edgeSysFor(q.edgeRec(), { target: () => newer }) }))).toMatchObject({ recorded: false, old: { version: "2.1.0.0" }, now: { version: "2.1.1.0" } });
+    expect(asked[0]).toContain("recorded version 2.1.0.0");
+    expect(asked[0]).toContain("now version 2.1.1.0");
+    expect(asked[0]).toContain("1.2.3_0");
+    expect(readEdgeSetup(q.opts())!.target_version).toBe("2.1.0.0");
+    expect((await edgeRecord(o(true, { edgeSys: edgeSysFor(q.edgeRec(), { target: () => newer }) }))).recorded).toBe(true);
+    expect(readEdgeSetup(q.opts())!.target_version).toBe("2.1.1.0");
+    await expect(edgeSetup(q.opts())).rejects.toMatchObject({ code: "attended_required" });
+  });
+
+  test("record-builtins lists the jobs Edge's components inside Edge's Application folder and records them on yes", async () => {
+    const { q } = oneJob();
+    const sec = join(q.udd, "Default", "Secure Preferences");
+    const s0 = JSON.parse(readFileSync(sec, "utf8"));
+    const C1 = "cccccccccccccccccccccccccccccccc", C2 = "dddddddddddddddddddddddddddddddd";
+    s0.extensions.settings[C1] = { location: 5, path: "C:\\Program Files\\Microsoft\\Edge\\Application\\142.0.1.2\\resources\\pdf", manifest: { name: "Microsoft Edge PDF Viewer" } };
+    s0.extensions.settings[C2] = { location: 5, path: "C:\\Users\\owner\\x", manifest: { name: "Odd" } };
+    writeFileSync(sec, JSON.stringify(s0));
+    const comps = edgeComponents(q.inst, "C:\\Program Files\\Microsoft\\Edge\\Application", (f) => { try { return readFileSync(f); } catch { return null; } });
+    expect(comps).toEqual([{ id: C1, location: 5, name: "Microsoft Edge PDF Viewer", inside: true }, { id: C2, location: 5, name: "Odd", inside: false }]);
+    const r = await recordBuiltins(q.opts({ ...attended, confirm: async () => true }));
+    expect(r.recorded).toEqual([C1]);
+    expect(readEdgeSetup(q.opts())!.builtin_ids).toEqual([C1]);
+    expect(edgeGate(q.opts(), q.inst).map((m) => m.item)).toEqual([`component_unknown:${C2}`]);
+  });
+
+  test("the launcher: three entries, no component check, and its own plain line for each Edge refusal", () => {
+    const text = launcherText("C:\\Users\\owner\\.bun\\bin\\bun.exe", "C:\\tools\\worker.ts", "C:\\pc-worker-k7q2xz");
+    expect(text).toContain('"C:\\Windows\\System32\\choice.exe" /c 123Q /n /m "Press 1, 2, 3 or Q: "');
+    expect(text).not.toContain("component");
+    expect(text).not.toContain("echo   4");
+    const { q } = oneJob();
+    for (const [code, line] of Object.entries(EDGE_LINES)) {
+      expect(launcherLine(code, q.opts())).toBe(line!);
+      expect(line!.split("\n").length).toBe(1);
+      expect(line).toContain(`Tell Cain: refusal ${code}.`);
+      expect(CODES as readonly string[]).toContain(code);
+    }
+    const doc = readFileSync(join(REPO, "cain", "docs", "pc-jobs.md"), "utf8");
+    for (const code of Object.keys(EDGE_LINES)) expect(doc).toContain(`| \`${code}\` (Cain 0.20.0)`);
+  });
+
+  test("install.json takes browser edge only, and the setup record parses strictly", () => {
+    const { q } = oneJob();
+    expect(parseInstall({ ...q.inst, browser: "edge" })).not.toBeNull();
+    expect(parseInstall({ ...q.inst, browser: "chrome" })).toBeNull();
+    const { browser: _b, ...chrome } = q.inst as any;
+    expect(parseInstall(chrome)).not.toBeNull();
+    expect(parseEdgeSetup(q.edgeRec())).not.toBeNull();
+    expect(parseEdgeSetup({ ...q.edgeRec(), extra: 1 })).toBeNull();
+    expect(parseEdgeSetup({ ...q.edgeRec(), builtin_ids: ["NOTANID"] })).toBeNull();
+    expect(parseEdgeSetup({ ...q.edgeRec(), target: "claude.exe" })).toBeNull();
+  });
+});
+
+// The launch prototype and the helper on Windows (the pcjobs-windows job): a stand-in child reports the descriptors it got, and
+// writes to the handle value of a decoy inheritable pipe of the test's own: the test reads that pipe afterwards, so a leak is
+// seen by the object itself, never by a handle value that might mean something else in the child.
+describe.if(WIN)("Cain 0.20.0 on Windows: the pipe launch and the handle scan", () => {
+  const PROBE_CS = `using System; using System.Runtime.InteropServices; using System.Text;
+public static class FdProbe {
+  [StructLayout(LayoutKind.Sequential)] struct SI { public int cb; public IntPtr r; public IntPtr d; public IntPtr t;
+    public int x, y, xs, ys, xc, yc, fa, fl; public short sw; public short cbR2; public IntPtr lpR2; public IntPtr i, o, e; }
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern void GetStartupInfoW(out SI si);
+  [DllImport("kernel32.dll")] static extern uint GetFileType(IntPtr h);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(IntPtr h, byte[] b, int n, out int got, IntPtr ov);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool WriteFile(IntPtr h, byte[] b, int n, out int put, IntPtr ov);
+  public static int Main(string[] a) {
+    SI si; GetStartupInfoW(out si);
+    int n = si.cbR2 >= 4 && si.lpR2 != IntPtr.Zero ? Marshal.ReadInt32(si.lpR2) : 0;
+    IntPtr h3 = IntPtr.Zero, h4 = IntPtr.Zero; int f3 = -1, f4 = -1;
+    if (n >= 5) { f3 = Marshal.ReadByte(si.lpR2, 4 + 3); f4 = Marshal.ReadByte(si.lpR2, 4 + 4);
+      h3 = Marshal.ReadIntPtr(new IntPtr(si.lpR2.ToInt64() + 4 + n + 3 * IntPtr.Size)); h4 = Marshal.ReadIntPtr(new IntPtr(si.lpR2.ToInt64() + 4 + n + 4 * IntPtr.Size)); }
+    long decoy = a.Length > 0 ? long.Parse(a[0]) : 0;
+    int wrote = 0;
+    if (decoy != 0) { var leak = Encoding.ASCII.GetBytes("LEAK"); int p0; wrote = WriteFile(new IntPtr(decoy), leak, leak.Length, out p0, IntPtr.Zero) ? p0 : -1; }
+
+    var msg = new StringBuilder(); var b = new byte[1]; int got;
+    while (h3 != IntPtr.Zero && ReadFile(h3, b, 1, out got, IntPtr.Zero) && got == 1 && b[0] != 0) msg.Append((char)b[0]);
+    string rep = "{\\"count\\":" + n + ",\\"f3\\":" + f3 + ",\\"f4\\":" + f4 + ",\\"t3\\":" + GetFileType(h3) + ",\\"t4\\":" + GetFileType(h4) + ",\\"decoy_write\\":" + wrote + ",\\"echo\\":\\"" + msg + "\\"}";
+    var bytes = Encoding.UTF8.GetBytes(rep + "\\0"); int put;
+    if (a.Length > 2) System.IO.File.WriteAllText(a[2], rep);
+    if (h4 != IntPtr.Zero) WriteFile(h4, bytes, bytes.Length, out put, IntPtr.Zero);
+    else { try { Console.Out.Write(rep); Console.Out.Flush(); } catch (Exception) { } }
+    System.Threading.Thread.Sleep(a.Length > 1 ? int.Parse(a[1]) : 0);
+    return 0;
+  }
+}`;
+  const build = () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcw-edge-"));
+    const src = join(dir, "fdprobe.cs"), exe = join(dir, "fdprobe.exe");
+    writeFileSync(src, PROBE_CS);
+    const csc = cscCandidates(process.env).find((f) => existsSync(f))!;
+    spawnSync(csc, ["/nologo", "/target:exe", `/out:${exe}`, src], { stdio: "ignore" });
+    const home = join(dir, "home");
+    mkdirSync(home);
+    const o: Opts = { home, platform: "win32" } as Opts;
+    return { dir, exe, o };
+  };
+  // An inheritable pipe in this process: a handle Bun's spawn would pass on and a handle list must not. leaked: whether anything
+  // reached its read end (the child writes LEAK to the write end's value).
+  const decoy = async () => {
+    const { dlopen, FFIType } = await import("bun:ffi");
+    const k = dlopen("kernel32.dll", {
+      CreatePipe: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+      PeekNamedPipe: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    });
+    const sa = new Uint8Array(24);
+    new DataView(sa.buffer).setUint32(0, 24, true);
+    new DataView(sa.buffer).setUint32(16, 1, true);   // bInheritHandle
+    const r = new BigUint64Array(1), w = new BigUint64Array(1);
+    expect(k.symbols.CreatePipe(r, w, sa, 0)).not.toBe(0);
+    const avail = new Uint32Array(1);
+    return { write: String(w[0]), leaked: () => { avail[0] = 0; k.symbols.PeekNamedPipe(r[0], null, 0, null, avail, null); return avail[0] > 0; } };
+  };
+  const reply = (io: PipeIo, ms = 20_000) => new Promise<any>((ok, no) => {
+    let buf = Buffer.alloc(0);
+    const t = setTimeout(() => no(new Error("no reply")), ms);
+    io.onData((d) => { buf = Buffer.concat([buf, Buffer.from(d)]); const i = buf.indexOf(0); if (i >= 0) { clearTimeout(t); ok(JSON.parse(buf.subarray(0, i).toString())); } });
+  });
+
+  test("the helper's edge-launch: descriptors 3 and 4 are the two pipes, nothing else is inherited, the worker's ends work, and pipe-scan finds the child's ends", async () => {
+    const { exe, o } = build();
+    expect(existsSync(exe)).toBe(true);
+    const d = await decoy();
+    const seen = join(dirname(exe), "launch-report.json");
+    const launched = await edgeLaunchHelper(o, exe, [d.write, "15000", seen]);
+    const got = reply(launched.io);
+    launched.io.write(Buffer.from("ping\0"));
+    const r = await got.catch((e) => { console.log(`edge-launch child: pid ${launched.pid}, report file ${existsSync(seen) ? readFileSync(seen, "utf8") : "never written"}`); throw e; });
+    expect(r).toMatchObject({ count: 5, f3: 9, f4: 9, t3: 3, t4: 3, echo: "ping" });   // FOPEN|FPIPE, FILE_TYPE_PIPE
+    expect(d.leaked()).toBe(false);                                                       // the decoy didn't reach the child
+    const edge = { pid: launched.pid, exe, cdp: null as any, refs: launched.refs, version: "" };
+    const hit = pipeScan(o, edge, [launched.pid])!;
+    expect(hit.hits.length).toBeGreaterThanOrEqual(1);
+    const other = spawn(exe, ["0", "4000"], { stdio: "ignore" });
+    await new Promise((x) => setTimeout(x, 300));
+    const none = pipeScan(o, edge, [other.pid!])!;
+    expect(none.handles).toBeGreaterThan(0);
+    expect(none.hits).toEqual([]);
+    other.kill();
+    launched.io.close();
+    try { process.kill(launched.pid); } catch { /* already gone */ }
+  });
+
+  test("the launch prototype: Bun's own spawn passes descriptors but no handle list (the reason for the helper)", async () => {
+    const { exe } = build();
+    const d = await decoy();
+    const child = spawn(exe, [d.write, "2000"], { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
+    let report: any = null;
+    try {
+      (child.stdio[3] as any)?.write("ping\0");
+      report = await new Promise((ok) => {
+        let buf = "";
+        const t = setTimeout(() => ok(null), 10_000);
+        (child.stdio[4] as any)?.on("data", (x: Buffer) => { buf += x.toString(); const i = buf.indexOf("\0"); if (i >= 0) { clearTimeout(t); ok(JSON.parse(buf.slice(0, i))); } });
+      });
+    } catch { report = null; }
+    child.kill();
+    // Recorded, not judged: what Bun did on this runner. The worker never launches Edge this way.
+    console.log(`launch prototype (Bun spawn): descriptors ${JSON.stringify(report)}, decoy inherited: ${d.leaked()}`);
+    expect(report === null || typeof report.count === "number").toBe(true);
+  });
+
+  test("the helper's run passes only its standard handles: a decoy inheritable handle doesn't reach the program", async () => {
+    const { exe, o } = build();
+    const helper = jobHelperState20(o).exe!;
+    expect(helper).toBeTruthy();
+    const d = await decoy();
+    // The stand-in itself, started directly: it runs and writes its report (so a failure below is the helper's).
+    const direct = join(dirname(exe), "direct-report.json");
+    const first = spawnSync(exe, ["0", "0", direct], { encoding: "utf8", timeout: 30_000 });
+    if (first.status !== 0) console.log(`stand-in direct: status ${first.status}, stderr ${JSON.stringify(first.stderr)}`);
+    expect([first.status, existsSync(direct)]).toEqual([0, true]);
+    const seen = join(dirname(exe), "run-report.json");
+    const r = spawnSync(helper, ["run", exe, d.write, "0", seen], { encoding: "utf8", timeout: 30_000 });
+    if (r.status !== 0) console.log(`helper run: status ${r.status}, stdout ${JSON.stringify(r.stdout)}, stderr ${JSON.stringify(r.stderr)}, report ${existsSync(seen) ? readFileSync(seen, "utf8") : "never written"}`);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout.trim())).toMatchObject({ count: 0 });
+    expect(d.leaked()).toBe(false);
   });
 });

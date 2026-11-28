@@ -64,7 +64,7 @@ import { createHash, createHmac, generateKeyPairSync, createPrivateKey, createPu
 import {
   addressCtxFor, canonical, checkFacts, factsFor, isReadOnly, jobText, keyFingerprint, LEASE_MS, HEARTBEAT_INTERVAL_MS, newAttempt, onLogin, onPin, onRedirect, parseAllowlist,
   parseHeartbeat, parseJob, parseKeys, parseResult, pinFor, riskyMatch, resultText, sanitizeUrl, signAllowlist, signerOf, SKEW_MS, stateAfter,
-  attributesGood, KID, TOOL, registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScopeProblem, queryAllowed, plainHost, PSL_FILE, PSL_SHA256, pslText, QUERY_MAX,
+  attributesGood, CODES, KID, TOOL, registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScopeProblem, queryAllowed, plainHost, PSL_FILE, PSL_SHA256, pslText, QUERY_MAX,
   type Allow, type Checked, type Code, type FactType, type Handoff, type Heartbeat, type Job, type Reason, type Result, type Status,
 } from "./core.ts";
 import { publicOf } from "../link/shipkey.ts";
@@ -127,6 +127,8 @@ export interface Opts {
   exeVersion?: (exe: string) => string | null;      // a test's stand-in for an executable's file version (Windows reads it with chromeExeVersions)
   chromePs?: () => string;                          // a test's stand-in for chromeExeVersions' PowerShell output (throws as execFileSync would)
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
+  exeIdentity?: IdentityReader;                     // Windows: a claude.exe's file identity (readExeIdentity unless a test stands in)
+  hostList?: () => HostListing | undefined;         // Windows: every native messaging host registered for Chrome (hostListing unless a test stands in)
   forcelist?: () => ForceList;                      // Windows: Chrome's extension policies as read now (readPolicy unless a test stands in)
   reg?: RegQuery;                                   // Windows: one reg query call, for readPolicy (the real reg.exe unless a test stands in)
   policyCacheDirs?: (string | null)[];              // Windows: the cloud policy cache folders checked (policyCacheDirs unless a test stands in; null: one the environment doesn't name)
@@ -144,6 +146,13 @@ export interface Opts {
   jobHelper?: string | null;                        // Windows: the containment helper's path, null for none (ensureJobHelper unless a test stands in)
   csc?: (env: Record<string, string | undefined>) => string | null; // Windows: the compiler's path (cscPath unless a test stands in)
   holders?: (files: string[]) => Holder[];          // what holds files a sweep couldn't delete (fileHolders unless a test stands in)
+  confirm?: (question: string) => Promise<boolean>; // a yes or no question to the owner at setup (askYesNo unless a test stands in)
+  edgeSys?: EdgeSys;                                // Cain 0.20.0: what the Edge gate reads from the registry and the system (realEdgeSys unless a test stands in)
+  edgeDisk?: EdgeDiskReads;                         // the Edge gate's file reads (the real disk unless a test stands in)
+  edgeExe?: string | null;                          // msedge.exe's path (edgeExe's search unless a test stands in; null: none)
+  edgeLaunch?: EdgeLauncher;                        // starts Edge with the pipe (edgeLaunchHelper unless a test stands in)
+  edgePolicyMs?: number;                            // how long the policy page may take to show its table (15 s unless a test sets it)
+  pipeScan?: (pids: number[]) => PipeScan | null;   // the handle scan over the claude.exe tree (pcw-jobrun pipe-scan unless a test stands in)
   resolveHosts?: boolean;                           // false: the hook doesn't resolve host names (tests without a network); on otherwise
 }
 
@@ -183,6 +192,7 @@ const P = {
   hookMargin: (o: Opts) => join(o.home, "hook-margin.json"),
   hookWorst: (o: Opts) => join(o.home, "hook-worst.json"),
   versionHold: (o: Opts) => join(o.home, "version-hold.json"),
+  edgeSetup: (o: Opts) => join(o.home, "edge-setup.json"),            // Cain 0.20.0: the Edge setup record (edgeSetupRecord)
 };
 
 export const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -232,6 +242,7 @@ export interface Install {
   profile: { user_data_dir: string; profile_directory: string; profile_name: string; extension_id: string };
   other_user_data_dirs: string[];
   default_app_ids?: string[];
+  browser?: "edge";                                 // Cain 0.20.0: the jobs browser; absent is Chrome, which runs no job (browser_not_edge)
 }
 const INSTALL_KEYS = ["v", "owner_fpr", "claude", "session_minutes", "unattended", "confirm_path", "diagnostics", "native_host_manifest", "profile", "other_user_data_dirs"];
 const PROFILE_KEYS = ["user_data_dir", "profile_directory", "profile_name", "extension_id"];
@@ -239,7 +250,8 @@ const str = (x: unknown) => typeof x === "string" && x.length > 0 && x.length < 
 const same = (o: any, keys: string[]) => !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
 
 export function parseInstall(x: any): Install | null {
-  const keys = x && typeof x === "object" && "default_app_ids" in x ? [...INSTALL_KEYS, "default_app_ids"] : INSTALL_KEYS;
+  const keys = [...INSTALL_KEYS, ...(x && typeof x === "object" && "default_app_ids" in x ? ["default_app_ids"] : []), ...(x && typeof x === "object" && "browser" in x ? ["browser"] : [])];
+  if (x && typeof x === "object" && "browser" in x && x.browser !== "edge") return null;
   if (x && "default_app_ids" in x && (!Array.isArray(x.default_app_ids) || x.default_app_ids.length > 10 || !x.default_app_ids.every((i: unknown) => typeof i === "string" && /^[a-p]{32}$/.test(i)))) return null;
   if (!same(x, keys) || x.v !== 1 || typeof x.owner_fpr !== "string" || !/^[0-9a-f]{64}$/.test(x.owner_fpr) || !str(x.claude)
     || !Number.isInteger(x.session_minutes) || x.session_minutes < 1 || x.session_minutes * 60_000 > MAX_SESSION_MS
@@ -320,7 +332,7 @@ export function aclLines(path: string): string[] | null {
 }
 
 export function filesTrusted(o: Opts): boolean {
-  const files = [P.allow(o), P.owner(o), P.install(o), o.home, ...[P.confirmed(o), P.marker(o)].filter(exists)];
+  const files = [P.allow(o), P.owner(o), P.install(o), o.home, ...[P.confirmed(o), P.marker(o), P.edgeSetup(o)].filter(exists)];
   for (const f of files) {
     if (!exists(f)) return false;
     if (platform(o) === "win32") {
@@ -720,13 +732,15 @@ export const CHROME_LOCATIONS: readonly number[] = [COMPONENT_LOCATION, 10];
 // Policy locations: kExternalPolicyDownload (7) and kExternalPolicy (9).
 export const POLICY_LOCATIONS: readonly number[] = [7, 9];
 // The extensions Chrome installs itself, by id: the Web Store, Web Store Payments, the PDF viewer,
-// Google Hangouts, Network Speech, CryptoToken, Feedback and the Cast media router.
+// Google Hangouts, Network Speech (both ids), Gemini in Chrome, CryptoToken, Feedback and the Cast media router.
 export const CHROME_BUILTIN_IDS: readonly string[] = [
   "ahfgeienlihckogmohjhadlkjgocpleb", // Web Store
   "nmmhkkegccagdldgiimedpiccmgmieda", // Chrome Web Store Payments
   "mhjfbmdgcfjbbpaeojofohoefgiehjai", // Chrome PDF Viewer
   "nkeimhogjdpnpccoofpliimaahmaaome", // Google Hangouts
-  "neajdppkdcdipfabeoofebfddakdcjhd", // Google Network Speech
+  "neajdppkdcdipfabeoofebfddakdcjhd", // Google Network Speech (its older id)
+  "fignfifoniblkonapihmkfakmlgkbkcf", // Google Network Speech (Cain 0.19.1: its id in Chrome 158)
+  "admccjkmockfdflocgggjfgdacdodkdf", // Gemini in Chrome (Cain 0.19.1: a component since Chrome 158)
   "kmendfapggjehodndflmmgagdbamhnfd", // CryptoToken
   "gfdkimpbcpahaombhbimeihdjnejgicl", // Feedback
   "pkedcjkdefgpdelpbcmbmeomcjbeemfm", // Chrome Media Router
@@ -790,7 +804,27 @@ function segKind(segs: string[], env: Record<string, string | undefined>): "chro
 // and links followed) or null when it doesn't exist or can't be resolved; chromeExe the worker's own chrome.exe as the
 // environment's install folders hold it (Program Files, either view, then LocalAppData), or null. The tests hand in a
 // stand-in (setDiskStandIn); the worker never does.
-export interface Disk { real: (p: string) => string | null; chromeExe: (env: Record<string, string | undefined>) => string | null; env: Record<string, string | undefined> }
+// list (Cain 0.19.1, review round 1): a folder's entry names, or null when it can't be read; a stand-in without it lists nothing.
+// Review round 2: cased, whether a path's folders are written exactly as their parents list them (directory entries, not a
+// canonical string); reparse, whether a path is a reparse point (a junction or a symbolic link: lstat), null when it can't be
+// read. Cain 0.20.0: the Edge gate checks the jobs user data folder and its Extensions folder with cased and reparse.
+export interface Disk { real: (p: string) => string | null; chromeExe: (env: Record<string, string | undefined>) => string | null; env: Record<string, string | undefined>;
+  list?: (dir: string) => string[] | null; cased?: (path: string) => boolean; reparse?: (path: string) => boolean | null }
+// Each segment of an absolute path (a drive path or a POSIX one) listed by its parent folder exactly as written.
+export function casedSegs(path: string, list: (dir: string) => string[] | null): boolean {
+  const win = /^[A-Za-z]:[\\/]/.test(path);
+  if (!win && !path.startsWith("/")) return false;
+  const sep = win ? "\\" : "/";
+  const segs = path.replace(/[\\/]+/g, sep).split(sep);
+  if (segs.slice(1).some((x) => !x || x === "." || x === "..")) return false;
+  for (let i = 1; i < segs.length; i++) {
+    const dir = i === 1 ? `${segs[0]}${sep}` : segs.slice(0, i).join(sep);
+    const names = list(dir);
+    if (!names || !names.includes(segs[i])) return false;
+  }
+  return true;
+}
+const listDir = (d: string) => { try { return readdirSync(d); } catch { return null; } };
 export function workerChromeExe(env: Record<string, string | undefined>): string | null {
   for (const r of [...programFilesRoots(env).slice(0, 2), env.LOCALAPPDATA ?? env.LocalAppData]) if (r) {
     const f = join(r, "Google", "Chrome", "Application", "chrome.exe");
@@ -798,7 +832,9 @@ export function workerChromeExe(env: Record<string, string | undefined>): string
   }
   return null;
 }
-export const realDisk = (): Disk => ({ real: (p) => { try { return realpathSync.native(p); } catch { return null; } }, chromeExe: workerChromeExe, env: process.env });
+export const realDisk = (): Disk => ({ real: (p) => { try { return realpathSync.native(p); } catch { return null; } }, chromeExe: workerChromeExe, env: process.env,
+  list: listDir, cased: (p) => casedSegs(p, listDir),
+  reparse: (p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return null; } } });
 let diskStandIn: Disk | null = null;
 export const setDiskStandIn = (d: Disk | null) => { diskStandIn = d; };
 export const diskNow = (): Disk => diskStandIn ?? realDisk();
@@ -846,6 +882,8 @@ export function pathKind(path: unknown, userDataDir: string, _profileDirectory?:
 // 0.12.2, fourth pass: a real path under Chrome's install folder is required; no path is foreign. Sixth pass: the same at
 // location 10 (external component); the fifth pass's user data folder branch is removed.
 export const EXTERNAL_COMPONENT_LOCATION = 10;
+// Cain 0.20.0: the Chrome 158 component exception (a component at location 5 whose path is missing) is gone with the
+// second design: Chrome is a diagnostic browser only, and the Edge gate (edgeProfileItems) has its own rule.
 export const chromeOwn = (id: string, location: number | null, pk: PathKind) =>
   CHROME_BUILTIN_IDS.includes(id) && location !== null && CHROME_LOCATIONS.includes(location) && pk === "chrome_install";
 // 0.12.2, sixth pass: an entry's path as printed for an external component (location 10) that isn't Chrome's own: the
@@ -1213,7 +1251,8 @@ function combine(lines: ExtensionLine[]): ExtensionLine {
   const unrecognised = [...new Set(lines.flatMap((x) => x.unrecognised))];
   return { ...base, kind, status, enabled: status !== "present, off", component: kind === "chrome", unrecognised: kind === "claude" ? [] : unrecognised };
 }
-export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST): ExtensionPrefs {
+// chromeVersion: the running Chrome's version as the caller read it (kept with the gate's snapshot, gateAgain).
+export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST, chromeVersion: string | null = null): ExtensionPrefs {
   const p = inst.profile;
   const { files, merged, views, disagree, uninstallsBad } = readPrefs(inst);
   const hivesOf = (id: string) => [...new Set(policy.entries.filter((x) => x.id === id).map((x) => x.hive))];
@@ -1857,7 +1896,7 @@ const names = (cmd: string, host: string | null) => !!host && slashes(cmd.replac
 
 // The dedicated Chrome's browser process: Chrome (no --type, not a cmd.exe) whose command
 // line carries the worker's --user-data-dir.
-export const isDedicated = (p: Proc | undefined, inst: Install): p is Proc => !!p && !!p.cmd && isBrowser(p) && browserOf(p.cmd) === "chrome"
+export const isDedicated = (p: Proc | undefined, inst: Install): p is Proc => !!p && !!p.cmd && isBrowser(p) && browserOf(p.cmd) === (jobsBrowser(inst) === "edge" ? "msedge" : "chrome")
   && sameProfileDir(p.cmd, inst.profile.user_data_dir);
 
 // A parent gone, or its PID reused, is host_parent_gone, not extension_elsewhere: the
@@ -1945,11 +1984,73 @@ export function registeredManifests(name: string, plat = process.platform): RegE
   }
   return out;
 }
+// Review round 2: native hosts under any name. Chrome starts any registered host whose manifest lists the extension's origin, so a
+// host of another name (the Claude desktop app's own, or one planted) could answer Claude in Chrome. hostListing reads every
+// subkey of NativeMessagingHosts in the three views and its manifest path; manifestViews reads each manifest and refuses
+// (manifest_path_mismatch) when a host other than the pinned one lists chrome-extension://<the install's extension id>/ in
+// allowed_origins (other_host:<name>), or its host program is in the desktop app's folders (desktop_host:<name>).
+// Review round 4: a view that can't be read, or a manifest that can't be read, refuses unconditionally (host_scan_failed),
+// naming the registry key (and view) that couldn't be read, at every entry point: check-host, bind-profile, the probe, the
+// job preflight and the read right before a job's session. Whether a desktop app process runs no longer matters.
+export interface HostListing { entries: (RegEntry & { name: string })[]; failed: string[] }
+export function hostListing(plat = process.platform, reg: RegQuery = regQuery): HostListing | undefined {
+  if (plat !== "win32") return undefined;
+  const out: HostListing = { entries: [], failed: [] };
+  for (const v of HOST_VIEWS) {
+    const r = reg([v.key, v.flag]);
+    if (regAbsent(r)) continue;
+    if (r.status !== 0 || r.error) { out.failed.push(v.view); continue; }
+    const names = (r.stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => /^HKEY_[A-Z_]+\\/i.test(l) && l.toLowerCase() !== v.key.replace(/^HKCU/, "HKEY_CURRENT_USER").replace(/^HKLM/, "HKEY_LOCAL_MACHINE").toLowerCase())
+      .map((l) => l.split("\\").pop() ?? "").filter(Boolean);
+    for (const name of names) {
+      const e = reg([`${v.key}\\${name}`, "/ve", v.flag]);
+      if (regAbsent(e)) continue;
+      const m = e.status === 0 && !e.error ? /REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/m.exec(e.stdout ?? "") : null;
+      if (m) out.entries.push({ view: v.view, name, path: m[1] });
+      else if (e.status !== 0 || e.error) out.failed.push(`${v.view}:${name}`);
+    }
+  }
+  return out;
+}
+const shownHost = (n: string) => /^[A-Za-z0-9._-]{1,128}$/.test(n) ? n : "unnamed";
+// The registry key a listing failure names: a view ("HKLM32") or a host in a view ("HKCU:<name>"), as reg.exe would take it.
+export function hostKeyOf(failed: string): string {
+  const [view, ...rest] = failed.split(":");
+  const v = HOST_VIEWS.find((x) => x.view === view);
+  if (!v) return `a registry view (${shownHost(failed)})`;
+  const name = rest.join(":");
+  return `${v.key}${name ? `\\${shownHost(name)}` : ""} (${v.flag}${name ? "" : ", the view itself"})`;
+}
+// Review round 4: what the scan saw, for the snapshot bind-profile keeps (bound-hosts.json) and every later scan is compared
+// with: each registered host in each view, its manifest path (normalized) and the manifest's SHA-256 (null when unreadable).
+export interface HostSnap { view: RegEntry["view"]; name: string; path: string; sha256: string | null }
+const snapKey = (h: HostSnap) => `${h.view}|${h.name.toLowerCase()}`;
+const manifestSha = (file: string): string | null => { try { return createHash("sha256").update(readFileSync(file)).digest("hex"); } catch { return null; } };
+function otherHosts(o: Opts, inst: Install, pinnedName: string, mismatched: string[], hosts: HostSnap[]): string | null {
+  const listing = (o.hostList ?? (o.registry ? () => ({ entries: [], failed: [] }) : () => hostListing(platform(o), o.reg ?? regQuery)))();
+  if (!listing) return null;
+  const origin = `chrome-extension://${inst.profile.extension_id}/`.toLowerCase();
+  const unread = listing.failed.map(hostKeyOf);
+  for (const e of listing.entries) {
+    if (e.name.toLowerCase() === pinnedName.toLowerCase()) continue;      // the pinned name: every view's path is compared above
+    const file = e.path.trim().replace(/^"+|"+$/g, "").trim();
+    const m = readJson(file);
+    hosts.push({ view: e.view, name: e.name, path: normalPath(file), sha256: manifestSha(file) });
+    if (!m || typeof m !== "object") { unread.push(`${hostKeyOf(`${e.view}:${e.name}`)}, its manifest`); continue; }
+    const origins: unknown[] = Array.isArray(m.allowed_origins) ? m.allowed_origins : [];
+    const prog = typeof m.path === "string" ? (pathWin32.isAbsolute(m.path) ? m.path : pathWin32.join(pathWin32.dirname(file), m.path)) : "";
+    if (origins.some((x) => typeof x === "string" && x.trim().replace(/\/?$/, "/").toLowerCase() === origin)) mismatched.push(`other_host:${shownHost(e.name)}`);
+    else if (prog && DESKTOP_APP_DIR.test(folded(prog))) mismatched.push(`desktop_host:${shownHost(e.name)}`);
+  }
+  if (!unread.length) return null;
+  mismatched.push("host_scan_failed");
+  return unread.join("; ");
+}
 export const normalPath = (p: string) => slashes(resolve(p.trim().replace(/^"+|"+$/g, "").trim())).replace(/\/+$/, "");
 const HOST_NAME = /^[a-z0-9_]+(\.[a-z0-9_]+)*$/;
 // What the views hold, against install.json: the views whose entry differs (or "none" when
 // no view has one), and how many distinct paths they hold between them.
-export interface ManifestViews { code: "manifest_path_mismatch" | null; entries: RegEntry[]; mismatched: string[]; distinct: number }
+export interface ManifestViews { code: "manifest_path_mismatch" | null; entries: RegEntry[]; mismatched: string[]; distinct: number; unread?: string; hosts?: HostSnap[] }
 export function manifestViews(o: Opts, inst: Install): ManifestViews {
   const name = readJson(inst.native_host_manifest)?.name;
   if (typeof name !== "string" || !HOST_NAME.test(name)) return { code: "manifest_path_mismatch", entries: [], mismatched: ["unreadable_manifest"], distinct: 0 };
@@ -1959,13 +2060,28 @@ export function manifestViews(o: Opts, inst: Install): ManifestViews {
   const mismatched = reg.filter((e) => normalPath(e.path) !== want).map((e) => e.view);
   const distinct = new Set(reg.map((e) => normalPath(e.path))).size;
   if (!reg.length) return { code: "manifest_path_mismatch", entries: reg, mismatched: ["none"], distinct };
-  return { code: mismatched.length || distinct > 1 ? "manifest_path_mismatch" : null, entries: reg, mismatched, distinct };
+  // Cain 0.19.1, review round 1: the pinned manifest itself may not name the Claude desktop app's own host program.
+  const host = hostPath(inst);
+  if (host && DESKTOP_APP_DIR.test(folded(host))) mismatched.push("desktop_app_host");
+  const hosts: HostSnap[] = reg.map((e) => { const f = e.path.trim().replace(/^"+|"+$/g, "").trim(); return { view: e.view, name, path: normalPath(f), sha256: manifestSha(f) }; });
+  const unread = otherHosts(o, inst, name, mismatched, hosts);
+  hosts.sort((x, y) => snapKey(x) < snapKey(y) ? -1 : snapKey(x) > snapKey(y) ? 1 : 0);
+  return { code: mismatched.length || distinct > 1 ? "manifest_path_mismatch" : null, entries: reg, mismatched, distinct, hosts, ...(unread ? { unread } : {}) };
 }
+// The Claude desktop app's install folders (its own native host lives there).
+const DESKTOP_APP_DIR = /\\windowsapps\\claude_[^\\]*\\|\\anthropicclaude\\/;
 // null when every registered view matches (or there's no registry to read); manifest_path_mismatch otherwise.
 export const manifestCheck = (o: Opts, inst: Install): "manifest_path_mismatch" | null => manifestViews(o, inst).code;
 const manifestDetail = (m: ManifestViews) => `the native host manifest registered for Claude in Chrome isn't the one install.json names (native_host_manifest): `
   + (m.mismatched.includes("none") ? "no registry view has an entry" : `${m.mismatched.join(", ") || "the views disagree"} differs${m.distinct > 1 ? `; ${m.distinct} distinct paths across the views` : ""}`)
-  + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "");
+  + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "")
+  + (m.mismatched.includes("desktop_app_host") ? " (the pinned manifest names the Claude desktop app's own host program, not Claude Code's: see Troubleshooting)" : "")
+  + (m.mismatched.some((x) => x.startsWith("other_host:")) ? " (another native host lists Claude in Chrome's origin: see Troubleshooting)" : "")
+  + (m.mismatched.some((x) => x.startsWith("desktop_host:")) ? " (a native host runs a program in the Claude desktop app's folder: see Troubleshooting)" : "")
+  + (m.mismatched.includes("host_scan_failed") ? `; host_scan_failed: the worker couldn't read ${m.unread ?? "a registry view"}, so it can't tell whether another host answers Claude in Chrome: read that key with reg query, then remove or repair the entry (see Troubleshooting), then run check-host again` : "");
+
+// Cain 0.20.0: the native host scan is a diagnostic (check-host on Chrome): the jobs browser is Edge, whose host is
+// registered under HKLM only and compared with the setup record (edgeHostItems) at every gate.
 
 // The extension's hosts left behind by a browser that has gone: their parent is gone, or
 // its PID now belongs to a process that started after them. The preflight fails on them
@@ -2014,6 +2130,886 @@ export function openChrome(o: Opts): { started: string; args: string[] } {
   return { started: exe, args };
 }
 
+// A yes or no question to the owner at his PC (the Edge setup's question and the re-record step's go).
+export const askYesNo = (question: string) => new Promise<boolean>((ok) => {
+  process.stderr.write(`${question}\n`);
+  process.stdin.resume();
+  process.stdin.once("data", (d) => { process.stdin.pause(); ok(/^\s*y(es)?\s*$/i.test(String(d))); });
+});
+
+// ==== The Edge jobs browser (Cain 0.20.0, the second design, stage 1) ===========================================
+// The gate the Chrome builds had read state: the profile's Preferences and the registry's native hosts. A check that reads
+// state can't stop code the browser itself may load or launch, so enforcement is the browser's own policy, verified as
+// effective in the running browser before any job page opens; the reads stay, as verification layers. Browser policy on
+// Windows is per user or per machine, never per profile, so on the owner's daily Chrome it would reach his own browsing.
+// Microsoft Edge reads its own policy key (Software\Policies\Microsoft\Edge), looks native hosts up under its own key first,
+// installs Chrome Web Store extensions, takes --remote-debugging-pipe and comes with Windows 11, and Claude Code's docs name
+// it for Claude in Chrome. So the jobs browser is Edge, under machine policy that touches nothing of the owner's Chrome,
+// on the condition (asked once at setup, recorded) that he doesn't use Edge for his own browsing: the policies reach every
+// Edge profile on the machine. Chrome stays for check-host and dump-extensions as diagnostics; a job on Chrome refuses
+// (browser_not_edge).
+//
+// The flow, at bind-profile, the probe and every job (check-host runs the gate alone):
+//   1. the pre-launch gate (edgeGate), offline and fail-closed, before Edge starts: every miss refuses by name;
+//   2. Edge started by the worker through its helper (pcw-jobrun edge-launch), with --remote-debugging-pipe on two
+//      anonymous pipes passed as CRT descriptors 3 and 4 and no other handle (edgeLaunchHelper);
+//   3. the handshake over that pipe (Browser.getVersion) and a process check against the spawned process id;
+//   4. the effective policy read: edge://policy in a page the worker owns, its table read as text, every policy of the
+//      setup record required as Platform, Machine, Mandatory, OK, no conflict and the recorded value (effectiveItems);
+//      then that page closed. Only then does any job page open.
+export const EDGE_POLICY_KEY = "Software\\Policies\\Microsoft\\Edge";
+export const EDGE_HOST_KEY = "Software\\Microsoft\\Edge\\NativeMessagingHosts";
+export const EDGE_EXTERNAL_KEY = "Software\\Microsoft\\Edge\\Extensions";
+// Edge's own built-in component ids: unknown until captured on the PC (dump-extensions on Edge, then record-builtins writes
+// them into the setup record). Until then the gate refuses every component id by name (component_unknown:<id>): fail closed.
+export const EDGE_BUILTIN_IDS: readonly string[] = [];
+// Chromium's ManifestLocation numbers.
+export const LOC = { INTERNAL: 1, EXTERNAL_PREF: 2, EXTERNAL_REGISTRY: 3, UNPACKED: 4, COMPONENT: 5, EXTERNAL_PREF_DOWNLOAD: 6,
+  EXTERNAL_POLICY_DOWNLOAD: 7, COMMAND_LINE: 8, EXTERNAL_POLICY: 9, EXTERNAL_COMPONENT: 10 } as const;
+export const EDGE_COMPONENT_LOCATIONS: readonly number[] = [LOC.COMPONENT, LOC.EXTERNAL_COMPONENT];
+export type JobsBrowser = "edge" | "chrome";
+export const jobsBrowser = (inst: Install): JobsBrowser => inst.browser === "edge" ? "edge" : "chrome";
+export const BROWSER_NOT_EDGE_HINT = "jobs run in Microsoft Edge since Cain 0.20.0: Chrome is kept for check-host and dump-extensions only. Follow the Edge setup steps in pc-jobs.md (edge-setup first), then set \"browser\": \"edge\" in install.json";
+
+// msedge.exe: a machine install only (Program Files, then Program Files (x86), Microsoft\Edge\Application). A per-user
+// install (LocalAppData) refuses by name: the machine policy and the admin-only host are the design, and a per-user
+// Edge is the owner's own to change.
+export type EdgeExe = { exe: string } | { refuse: "edge_per_user_install" | "edge_missing"; why: string };
+export function edgeExe(env: Record<string, string | undefined>, has: (f: string) => boolean = existsSync): EdgeExe {
+  for (const r of programFilesRoots(env).slice(0, 2)) if (r) { const f = pathWin32.join(r, "Microsoft", "Edge", "Application", "msedge.exe"); if (has(f)) return { exe: f }; }
+  const local = env.LOCALAPPDATA ?? env.LocalAppData;
+  if (local && has(pathWin32.join(local, "Microsoft", "Edge", "Application", "msedge.exe")))
+    return { refuse: "edge_per_user_install", why: "Edge is installed for this user only (LocalAppData\\Microsoft\\Edge): the jobs browser must be the machine install under Program Files" };
+  return { refuse: "edge_missing", why: "msedge.exe isn't in Program Files or Program Files (x86)\\Microsoft\\Edge\\Application" };
+}
+// The arguments Edge starts with, pinned (a test holds them): the jobs user data folder and its one profile, sync off, no
+// default apps, no first-run page, and the pipe. Never --remote-debugging-port, --enable-automation, --load-extension or
+// any other switch.
+export const EDGE_PIPE_SWITCH = "--remote-debugging-pipe";
+export const EDGE_FORBIDDEN_SWITCHES: readonly string[] = ["--remote-debugging-port", "--enable-automation", "--load-extension", "--disable-extensions-except",
+  "--remote-debugging-address", "--remote-allow-origins", "--remote-debugging-io-pipes"];
+export const edgeLaunchArgs = (inst: Install): string[] =>
+  [`--user-data-dir=${inst.profile.user_data_dir}`, `--profile-directory=${inst.profile.profile_directory}`, "--disable-sync", "--disable-default-apps", "--no-first-run", EDGE_PIPE_SWITCH];
+
+// ---- The policies (item 2) --------------------------------------------------------------------------------------------
+export type PolicyValue = string[] | boolean;
+export const EDGE_POLICY_NAMES = ["ExtensionInstallBlocklist", "ExtensionInstallAllowlist", "NativeMessagingBlocklist", "NativeMessagingAllowlist",
+  "NativeMessagingUserLevelHosts", "BrowserGuestModeEnabled", "BrowserAddPersonEnabled", "RemoteDebuggingAllowed", "SyncDisabled"] as const;
+export type EdgePolicyName = typeof EDGE_POLICY_NAMES[number];
+export function edgePolicies(extensionId: string, hostName: string): Record<EdgePolicyName, PolicyValue> {
+  return { ExtensionInstallBlocklist: ["*"], ExtensionInstallAllowlist: [extensionId], NativeMessagingBlocklist: ["*"], NativeMessagingAllowlist: [hostName],
+    NativeMessagingUserLevelHosts: false, BrowserGuestModeEnabled: false, BrowserAddPersonEnabled: false, RemoteDebuggingAllowed: true, SyncDisabled: true };
+}
+export const EDGE_POLICY_MEANING: Record<EdgePolicyName, string> = {
+  ExtensionInstallBlocklist: "Edge installs and runs no extension at all...",
+  ExtensionInstallAllowlist: "...except Claude in Chrome, by its id.",
+  NativeMessagingBlocklist: "Edge starts no native messaging host at all...",
+  NativeMessagingAllowlist: "...except Claude Code's, by its name.",
+  NativeMessagingUserLevelHosts: "Edge ignores hosts registered for your user (HKCU): only the machine registration counts.",
+  BrowserGuestModeEnabled: "No guest windows.",
+  BrowserAddPersonEnabled: "No new Edge profiles.",
+  RemoteDebuggingAllowed: "The worker's own pipe to Edge is allowed (it is how the worker reads these policies back).",
+  SyncDisabled: "Edge sync is off, so no extension or setting arrives from a Microsoft account.",
+};
+// Never set, by design: either would install or configure extensions behind the allow list's back.
+export const EDGE_FORBIDDEN_POLICIES: readonly string[] = ["ExtensionInstallForcelist", "ExtensionSettings"];
+export const EDGE_CLOUD_NAMES: readonly string[] = ["CloudManagementEnrollmentToken", "CloudManagement", "CloudManagementEnrollmentMandatory"];
+// The host's admin-only folder, under ProgramData (the environment's, never assumed).
+export const edgeHostDir = (env: Record<string, string | undefined>) => pathWin32.join(env.ProgramData ?? env.PROGRAMDATA ?? "C:\\ProgramData", "CainPcJobs", "EdgeHost");
+const regQ = (s: string) => `"${s}"`;
+// The lines the owner runs once, from an elevated Command Prompt, after he has read them: each with one line of meaning
+// (rem). Policies in both registry views (the Policies key is shared between them on 64-bit Windows; both are written and
+// both are checked), the host's folder made admin-only, the manifest and the wrapper copied there from the drafts the
+// setup step wrote, and the host registered under HKLM (both views).
+export function edgeSetupLines(rec: EdgeSetup, drafts: { manifest: string; wrapper: string }): string[] {
+  const out: string[] = ["rem Run these once, from a Command Prompt started with Run as administrator, after reading each line."];
+  const pol = edgePolicies(rec.extension_id, rec.host_name);
+  for (const name of EDGE_POLICY_NAMES) {
+    out.push(`rem ${name}: ${EDGE_POLICY_MEANING[name]}`);
+    for (const view of ["/reg:64", "/reg:32"]) {
+      const v = pol[name];
+      if (Array.isArray(v)) v.forEach((x, i) => out.push(`reg add ${regQ(`HKLM\\${EDGE_POLICY_KEY}\\${name}`)} /v ${i + 1} /t REG_SZ /d ${regQ(x)} /f ${view}`));
+      else out.push(`reg add ${regQ(`HKLM\\${EDGE_POLICY_KEY}`)} /v ${name} /t REG_DWORD /d ${v ? 1 : 0} /f ${view}`);
+    }
+  }
+  const dir = pathWin32.dirname(rec.manifest_path);
+  out.push("rem The host's own folder: only Administrators and SYSTEM may change it, everyone may read and run it.",
+    `mkdir ${regQ(dir)}`,
+    `icacls ${regQ(dir)} /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"`,
+    "rem The host's manifest (it names only the wrapper and only Claude in Chrome's origin) and the wrapper (it starts claude.exe by its full path).",
+    `copy /y ${regQ(drafts.manifest)} ${regQ(rec.manifest_path)}`,
+    `copy /y ${regQ(drafts.wrapper)} ${regQ(rec.wrapper_path)}`,
+    "rem The host, registered for the whole machine under Edge's own key. Claude Code's own registration for Chrome (HKCU) stays as it is.",
+    `reg add ${regQ(`HKLM\\${EDGE_HOST_KEY}\\${rec.host_name}`)} /ve /t REG_SZ /d ${regQ(rec.manifest_path)} /f /reg:64`,
+    `reg add ${regQ(`HKLM\\${EDGE_HOST_KEY}\\${rec.host_name}`)} /ve /t REG_SZ /d ${regQ(rec.manifest_path)} /f /reg:32`);
+  return out;
+}
+// The host's two files, as the setup step drafts them: the manifest names the wrapper by its absolute path and only the
+// extension's origin; the wrapper invokes claude.exe by its absolute path, never through PATH.
+export const wrapperText = (target: string) => `@echo off\r\n"${target}" --chrome-native-host\r\n`;
+export const manifestText = (hostName: string, wrapperPath: string, extensionId: string) => JSON.stringify({ name: hostName,
+  description: "Claude Code, for the Cain PC jobs Edge", path: wrapperPath, type: "stdio", allowed_origins: [`chrome-extension://${extensionId}/`] }, null, 2) + "\n";
+// The wrapper's target, read back from its bytes: exactly the two lines wrapperText writes, the path absolute.
+export function wrapperTarget(text: string): string | null {
+  const m = /^@echo off\r\n"([A-Za-z]:\\[^"\r\n]+\\claude\.exe)" --chrome-native-host\r\n$/i.exec(text);
+  return m ? m[1] : null;
+}
+
+// ---- The setup record (edge-setup.json) ---------------------------------------------------------------------------------
+// Written by edge-setup, changed only by edge-record and record-builtins, each with the owner's go; locked down like the
+// worker's other records and checked by filesTrusted.
+export interface TargetIdentity { signer: string; status: string; version: string }
+export interface EdgeSetup {
+  v: 1; at: string; edge_daily_use: boolean; extension_id: string; host_name: string;
+  manifest_path: string; manifest_b64: string; wrapper_path: string; wrapper_b64: string;
+  target: string; target_signer: string; target_version: string;
+  builtin_ids: string[]; builtins_at: string | null;
+  policies: Record<string, PolicyValue>;
+}
+const SETUP_KEYS = ["v", "at", "edge_daily_use", "extension_id", "host_name", "manifest_path", "manifest_b64", "wrapper_path", "wrapper_b64", "target",
+  "target_signer", "target_version", "builtin_ids", "builtins_at", "policies"];
+const B64 = /^[A-Za-z0-9+/]*={0,2}$/;
+const isPolicyValue = (v: unknown): v is PolicyValue => typeof v === "boolean" || (Array.isArray(v) && v.length <= 20 && v.every((x) => typeof x === "string" && x.length < 200));
+export function parseEdgeSetup(x: any): EdgeSetup | null {
+  if (!same(x, SETUP_KEYS) || x.v !== 1 || typeof x.at !== "string" || typeof x.edge_daily_use !== "boolean" || !/^[a-p]{32}$/.test(x.extension_id ?? "")
+    || typeof x.host_name !== "string" || !HOST_NAME.test(x.host_name) || ![x.manifest_path, x.wrapper_path, x.target].every((p) => typeof p === "string" && (/^[A-Za-z]:\\/.test(p) || p.startsWith("/")))
+    || ![x.manifest_b64, x.wrapper_b64].every((b) => typeof b === "string" && B64.test(b)) || typeof x.target_signer !== "string" || typeof x.target_version !== "string"
+    || !Array.isArray(x.builtin_ids) || x.builtin_ids.length > 50 || !x.builtin_ids.every((i: unknown) => typeof i === "string" && /^[a-p]{32}$/.test(i))
+    || !(x.builtins_at === null || typeof x.builtins_at === "string") || !x.policies || typeof x.policies !== "object" || Array.isArray(x.policies)
+    || !Object.values(x.policies).every(isPolicyValue)) return null;
+  return x as EdgeSetup;
+}
+export const readEdgeSetup = (o: Opts): EdgeSetup | null => parseEdgeSetup(readJson(P.edgeSetup(o)));
+export function writeEdgeSetup(o: Opts, rec: EdgeSetup): void {
+  writeFileSync(P.edgeSetup(o), JSON.stringify(rec, null, 2) + "\n");
+  lockDown(o, P.edgeSetup(o));
+}
+const b64 = (b: Uint8Array | string) => Buffer.from(b).toString("base64");
+
+// claude.exe's signer subject, signature status and file version, read through PowerShell (Windows); a test stands in.
+const TARGET_PS = "$p = $env:PCW_TARGET_EXE; $v = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo; $s = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop; "
+  + "[pscustomobject]@{ signer = [string]$s.SignerCertificate.Subject; status = [string]$s.Status; version = [string]$v.FileVersion } | ConvertTo-Json -Compress";
+export function readTargetIdentity(exe: string, plat = process.platform): TargetIdentity | null {
+  if (plat !== "win32") return null;
+  try {
+    const j = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", TARGET_PS],
+      { encoding: "utf8", env: { ...process.env, PCW_TARGET_EXE: exe }, stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true }).trim());
+    return j && typeof j.signer === "string" && typeof j.status === "string" && typeof j.version === "string" ? { signer: j.signer, status: j.status, version: j.version } : null;
+  } catch { return null; }
+}
+
+// ---- What the gate reads (a test stands in for each) ------------------------------------------------------------------
+// reg: one reg query call (the view flag last, as regQuery requires); running: whether an Edge runs on the jobs folder (a
+// listed msedge.exe naming it, or its lockfile, which Edge holds open and deletes at exit); target: claude.exe's identity;
+// file: a file's bytes (null when it can't be read); acl: a folder's access list (aclLines).
+export interface EdgeSys {
+  reg: RegQuery; running: (udd: string) => boolean; target: (exe: string) => TargetIdentity | null;
+  file: (p: string) => Uint8Array | null; acl: (p: string) => string[] | null;
+  procs: () => Proc[] | null;   // the process list for the handshake, the run's watch and the handle scan's tree
+}
+const readBytes = (p: string): Uint8Array | null => { try { return readFileSync(p); } catch { return null; } };
+export function realEdgeSys(o: Opts): EdgeSys {
+  return { reg: o.reg ?? regQuery, target: (exe) => readTargetIdentity(exe, platform(o)), file: readBytes, acl: (p) => (o.acl ?? aclLines)(p),
+    procs: () => (o.procs ?? (() => listProcs(platform(o))))(),
+    running: (udd) => exists(join(udd, "lockfile")) || ((o.procs ?? (() => listProcs(platform(o))))() ?? []).some((p) => /msedge(\.exe)?"?(\s|$)/i.test(p.cmd) && !/--type=/.test(p.cmd) && sameProfileDir(p.cmd, udd)) };
+}
+const sysOf = (o: Opts): EdgeSys => o.edgeSys ?? realEdgeSys(o);
+
+// One reg query /s answer, as a tree: each key (relative to the one asked for, "" for itself) with its values.
+export interface RegValue { type: string; data: string }
+export type RegTree = Record<string, Record<string, RegValue>>;
+export function parseRegTree(text: string, key: string): RegTree {
+  const full = key.replace(/^HKLM\\/i, "HKEY_LOCAL_MACHINE\\").replace(/^HKCU\\/i, "HKEY_CURRENT_USER\\").toLowerCase();
+  const tree: RegTree = {};
+  let at: string | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (/^HKEY_/i.test(line)) {
+      const k = line.trim();
+      const low = k.toLowerCase();
+      at = low === full ? "" : low.startsWith(`${full}\\`) ? k.slice(full.length + 1) : null;
+      if (at !== null) tree[at] ??= {};
+      continue;
+    }
+    const v = /^\s{2,}(.+?)\s{2,}(REG_[A-Z_]+)\s{2,}(.*?)\s*$/.exec(line) ?? /^\s{2,}(.+?)\s{2,}(REG_[A-Z_]+)\s*$/.exec(line);
+    if (v && at !== null) tree[at][v[1] === "(Default)" ? "" : v[1]] = { type: v[2], data: v[3] ?? "" };
+  }
+  return tree;
+}
+type Read = { state: "absent" } | { state: "unreadable" } | { state: "tree"; tree: RegTree };
+function readTree(reg: RegQuery, key: string, view: string): Read {
+  const r = reg([key, "/s", view]);
+  if (regAbsent(r)) return { state: "absent" };
+  if (r.status !== 0 || r.error) return { state: "unreadable" };
+  return { state: "tree", tree: parseRegTree(r.stdout ?? "", key) };
+}
+const VIEWS = [{ flag: "/reg:64", name: "64" }, { flag: "/reg:32", name: "32" }] as const;
+const dword = (v: RegValue | undefined): boolean | null => v && v.type === "REG_DWORD" ? (/^0x0*1$/i.test(v.data) ? true : /^0x0+$/i.test(v.data) ? false : null) : null;
+
+// A miss: the item by name, the refusal code it maps to, and one plain line.
+export interface EdgeMiss { item: string; code: Code; line: string }
+const miss = (item: string, code: Code, line: string): EdgeMiss => ({ item, code, line });
+
+// The policy items: every policy of the record present under HKLM in both views with its value, nothing else under the
+// Edge policy key (a policy the machine already carries refuses by name, ExtensionInstallForcelist and ExtensionSettings
+// and the cloud management names each by their own), and nothing at all under HKCU's Edge policy key.
+export function edgePolicyItems(sys: EdgeSys, rec: EdgeSetup): EdgeMiss[] {
+  const out: EdgeMiss[] = [];
+  const want = rec.policies;
+  for (const v of VIEWS) {
+    const at = `HKLM${v.name}`;
+    const r = readTree(sys.reg, `HKLM\\${EDGE_POLICY_KEY}`, v.flag);
+    if (r.state === "unreadable") { out.push(miss(`policy_unreadable:${at}`, "edge_policy_missing", `HKLM\\${EDGE_POLICY_KEY} couldn't be read (${v.flag})`)); continue; }
+    const tree = r.state === "tree" ? r.tree : {};
+    const root = tree[""] ?? {};
+    for (const [name, value] of Object.entries(want)) {
+      if (Array.isArray(value)) {
+        const sub = tree[name];
+        if (!sub) { out.push(miss(`policy_missing:${name}@${at}`, "edge_policy_missing", `the policy ${name} isn't set under HKLM (${v.flag})`)); continue; }
+        const keys = Object.keys(sub);
+        const ok = keys.length === value.length && value.every((x, i) => sub[String(i + 1)]?.type === "REG_SZ" && sub[String(i + 1)].data === x);
+        if (!ok) out.push(miss(`policy_value:${name}@${at}`, "edge_policy_missing", `the policy ${name} under HKLM (${v.flag}) isn't exactly ${JSON.stringify(value)}`));
+      } else {
+        const got = dword(root[name]);
+        if (!(name in root)) out.push(miss(`policy_missing:${name}@${at}`, "edge_policy_missing", `the policy ${name} isn't set under HKLM (${v.flag})`));
+        else if (got !== value) out.push(miss(`policy_value:${name}@${at}`, "edge_policy_missing", `the policy ${name} under HKLM (${v.flag}) isn't ${value ? 1 : 0} (a REG_DWORD)`));
+      }
+    }
+    const extra = (n: string) => EDGE_CLOUD_NAMES.some((c) => c.toLowerCase() === n.toLowerCase()) ? miss(`cloud_management:${n}@${at}`, "edge_policy_missing", `${n} is under the Edge policy key: this Edge is enrolled in, or set up for, cloud management`)
+      : EDGE_FORBIDDEN_POLICIES.some((f) => f.toLowerCase() === n.split("\\")[0].toLowerCase()) ? miss(`policy_forbidden:${n.split("\\")[0]}@${at}`, "edge_policy_missing", `${n.split("\\")[0]} is set under the Edge policy key: it would install or configure extensions, so it must not be there`)
+      : miss(`policy_extra:${n}@${at}`, "edge_policy_missing", `the machine already carries the Edge policy ${n}: remove it, or tell Cain, before jobs run`);
+    for (const n of Object.keys(root)) if (!(n in want)) out.push(extra(n));
+    for (const k of Object.keys(tree)) if (k && !(Array.isArray(want[k.split("\\")[0]]) && !k.includes("\\"))) out.push(extra(k));
+  }
+  for (const v of VIEWS) {
+    const r = readTree(sys.reg, `HKCU\\${EDGE_POLICY_KEY}`, v.flag);
+    if (r.state === "unreadable") out.push(miss(`policy_user_unreadable:HKCU${v.name}`, "edge_policy_missing", `HKCU\\${EDGE_POLICY_KEY} couldn't be read (${v.flag})`));
+    else if (r.state === "tree") {
+      const names = [...Object.keys(r.tree[""] ?? {}), ...Object.keys(r.tree).filter(Boolean)];
+      for (const n of names) out.push(miss(`policy_user:${n}@HKCU${v.name}`, "edge_policy_missing", `the Edge policy ${n} is set for your user (HKCU): user policy could contradict the machine's, so none may be there`));
+    }
+  }
+  return dedupe(out);
+}
+const dedupe = (xs: EdgeMiss[]) => [...new Map(xs.map((x) => [x.item, x] as const)).values()];
+
+// An admin-only folder's access list (aclLines' lines): no write entry for any account but SYSTEM and Administrators,
+// and none inherited. A line that can't be read counts as one.
+export function adminOnlyProblems(lines: string[]): string[] {
+  const out: string[] = [];
+  for (const l of lines.map((x) => x.trim()).filter((x) => x && !x.startsWith("USER|"))) {
+    const parts = l.split("|").map((x) => x.trim());
+    if (parts.length !== 4) { out.push("unreadable"); continue; }
+    const [type, sid, rights, inherited] = parts;
+    if (type.toLowerCase() !== "allow" || !WRITE_RIGHTS.test(rights)) continue;
+    if (![SYSTEM_SID, ADMINS_SID].includes(sid) || inherited.toLowerCase() !== "false") out.push(sid);
+  }
+  return out;
+}
+// The host items: registered under HKLM only (the 64-bit view, and the 32-bit one absent or the same), none of that name
+// for the user, the manifest's bytes, the wrapper's bytes, the wrapper's target and the target's signer and version equal
+// to the setup record, the manifest naming only the wrapper and only the extension's origin, and the host folder
+// admin-only.
+export function edgeHostItems(sys: EdgeSys, rec: EdgeSetup): EdgeMiss[] {
+  const out: EdgeMiss[] = [];
+  const H = "edge_host_mismatch" as const;
+  const regOf = (hive: string, flag: string) => {
+    const r = sys.reg([`${hive}\\${EDGE_HOST_KEY}\\${rec.host_name}`, "/ve", flag]);
+    if (regAbsent(r)) return { state: "absent" as const };
+    const m = r.status === 0 && !r.error ? /REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/m.exec(r.stdout ?? "") : null;
+    return m ? { state: "path" as const, path: m[1] } : { state: "unreadable" as const };
+  };
+  for (const v of VIEWS) {
+    const u = regOf("HKCU", v.flag);
+    if (u.state !== "absent") out.push(miss(`host_user_level@HKCU${v.name}`, H, `${rec.host_name} is registered for your user (HKCU\\${EDGE_HOST_KEY}): only the machine's registration may exist; remove it with reg delete`));
+  }
+  const m64 = regOf("HKLM", "/reg:64"), m32 = regOf("HKLM", "/reg:32");
+  const same = (p: string) => normalPath(p) === normalPath(rec.manifest_path);
+  if (m64.state !== "path") out.push(miss(m64.state === "absent" ? "host_unregistered" : "host_unreadable@HKLM64", H, `${rec.host_name} isn't registered under HKLM\\${EDGE_HOST_KEY} (or couldn't be read): run the setup's reg add lines`));
+  else if (!same(m64.path)) out.push(miss("host_path@HKLM64", H, `${rec.host_name}'s registration names another manifest than the setup record's`));
+  if (m32.state === "unreadable" || (m32.state === "path" && !same(m32.path))) out.push(miss("host_path@HKLM32", H, `${rec.host_name}'s 32-bit registration differs from the setup record's`));
+  const manifest = sys.file(rec.manifest_path);
+  if (!manifest) out.push(miss("host_manifest_unreadable", H, `the host manifest at ${rec.manifest_path} can't be read`));
+  else {
+    if (sha(Buffer.from(manifest)) !== sha(Buffer.from(rec.manifest_b64, "base64"))) out.push(miss("host_manifest_changed", H, "the host manifest's bytes aren't the ones setup recorded"));
+    let j: any = null;
+    try { j = JSON.parse(Buffer.from(manifest).toString("utf8")); } catch { j = null; }
+    const origins = Array.isArray(j?.allowed_origins) ? j.allowed_origins : null;
+    if (!j || j.name !== rec.host_name || j.type !== "stdio" || typeof j.path !== "string" || normalPath(j.path) !== normalPath(rec.wrapper_path)
+      || !origins || origins.length !== 1 || origins[0] !== `chrome-extension://${rec.extension_id}/`)
+      out.push(miss("host_manifest_shape", H, `the host manifest must name exactly the wrapper and exactly chrome-extension://${rec.extension_id}/`));
+  }
+  const wrapper = sys.file(rec.wrapper_path);
+  if (!wrapper) out.push(miss("host_wrapper_unreadable", H, `the host wrapper at ${rec.wrapper_path} can't be read`));
+  else {
+    if (sha(Buffer.from(wrapper)) !== sha(Buffer.from(rec.wrapper_b64, "base64"))) out.push(miss("host_wrapper_changed", H, "the host wrapper's bytes aren't the ones setup recorded"));
+    const t = wrapperTarget(Buffer.from(wrapper).toString("utf8"));
+    if (!t || normalPath(t) !== normalPath(rec.target)) out.push(miss("host_target_changed", H, "the host wrapper doesn't start the claude.exe setup recorded, by its absolute path"));
+  }
+  const acl = sys.acl(pathWin32.dirname(rec.manifest_path));
+  if (acl === null || adminOnlyProblems(acl).length) out.push(miss("host_folder_writable", H, "the host's folder can be changed by accounts other than Administrators and SYSTEM: run the setup's icacls line again"));
+  const id = sys.target(rec.target);
+  if (!id) out.push(miss("host_target_unreadable", H, `claude.exe's signature and version at ${rec.target} couldn't be read`));
+  else {
+    if (id.status !== "Valid" || id.signer !== rec.target_signer) out.push(miss("host_signer_changed", H, `claude.exe's signer is ${JSON.stringify(id.signer)} (${id.status}), not the recorded ${JSON.stringify(rec.target_signer)}: run edge-record`));
+    if (id.version !== rec.target_version) out.push(miss("host_version_changed", H, `claude.exe is now version ${id.version}, setup recorded ${rec.target_version} (Claude Code updated itself): run edge-record, which shows both and asks your go`));
+  }
+  return out;
+}
+
+// The profile's Extensions folder, Preferences and Secure Preferences (extensions.settings), parsed strictly: only the
+// allowed id (location INTERNAL, its path inside Extensions\<id>) and the recorded built-in ids (component locations, their
+// paths inside Edge's Application folder) may appear. UNPACKED and COMMAND_LINE refuse by their names, any other location,
+// an unknown id, a path outside its root, a file that doesn't parse and a field the gate doesn't know each refuse by name.
+// Known entry fields: what Chromium and Edge write into an extension's entry (a field not on this list refuses).
+export const EDGE_ENTRY_FIELDS: readonly string[] = [
+  "account_extension_type", "active_bit", "active_permissions", "commands", "content_settings", "creation_flags", "disable_reasons", "events",
+  "first_install_time", "from_bookmark", "from_webstore", "granted_permissions", "incognito_content_settings", "incognito_preferences",
+  "install_time", "last_update_time", "location", "manifest", "needs_sync", "path", "preferences", "regular_only_preferences", "serviceworkerevents",
+  "state", "was_installed_by_default", "was_installed_by_oem", "withholding_permissions", "lastpingday", "ack_external", "install_signature",
+  "newAllowFileAccess", "dnr_static_ruleset", "dnr_dynamic_ruleset", "app_launcher_ordinal", "page_ordinal", "pinned_extension", "uninstall_url",
+  "allowlist", "pref_version_v2", "settings_override", "browser_action_visible",
+];
+const LOCATION_NAMES: Record<number, string> = { 1: "INTERNAL", 2: "EXTERNAL_PREF", 3: "EXTERNAL_REGISTRY", 4: "UNPACKED", 5: "COMPONENT",
+  6: "EXTERNAL_PREF_DOWNLOAD", 7: "EXTERNAL_POLICY_DOWNLOAD", 8: "COMMAND_LINE", 9: "EXTERNAL_POLICY", 10: "EXTERNAL_COMPONENT" };
+const inside = (child: string, root: string) => { const c = normDir(child), r = normDir(root); return c.startsWith(`${r}/`); };
+export function edgePrefsItems(inst: Install, rec: EdgeSetup, edgeApp: string | null, read: (p: string) => Uint8Array | null = readBytes): EdgeMiss[] {
+  const X = "extra_extension" as const;
+  const out: EdgeMiss[] = [];
+  const prof = join(inst.profile.user_data_dir, inst.profile.profile_directory);
+  const extRoot = join(prof, "Extensions");
+  const allowed = inst.profile.extension_id;
+  const builtins = new Set([...EDGE_BUILTIN_IDS, ...rec.builtin_ids]);
+  for (const file of ["Preferences", "Secure Preferences"]) {
+    const bytes = read(join(prof, file));
+    if (!bytes) { if (file === "Preferences") out.push(miss(`prefs_unreadable:${file}`, X, `the jobs profile's ${file} can't be read`)); continue; }
+    let j: any;
+    try { j = JSON.parse(Buffer.from(bytes).toString("utf8")); } catch { out.push(miss(`prefs_parse:${file}`, X, `the jobs profile's ${file} doesn't parse`)); continue; }
+    const ext = j?.extensions;
+    if (ext === undefined) continue;
+    if (!ext || typeof ext !== "object" || Array.isArray(ext)) { out.push(miss(`prefs_shape:${file}`, X, `extensions in ${file} isn't an object`)); continue; }
+    const settings = ext.settings;
+    if (settings === undefined) continue;
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) { out.push(miss(`prefs_shape:${file}`, X, `extensions.settings in ${file} isn't an object`)); continue; }
+    for (const [id, e] of Object.entries<any>(settings)) {
+      const shown = /^[a-p]{32}$/.test(id) ? id : "an id of an unknown shape";
+      if (!e || typeof e !== "object" || Array.isArray(e)) { out.push(miss(`prefs_shape:${shown}`, X, `${shown}'s entry in ${file} isn't an object`)); continue; }
+      for (const k of Object.keys(e)) if (!EDGE_ENTRY_FIELDS.includes(k)) out.push(miss(`prefs_field:${shown}:${/^[A-Za-z0-9_]{1,60}$/.test(k) ? k : "unnamed"}`, X, `${shown}'s entry in ${file} has a field the gate doesn't know`));
+      const loc = typeof e.location === "number" ? e.location : null;
+      if (loc === LOC.UNPACKED) { out.push(miss(`prefs_unpacked:${shown}`, X, `${shown} is an unpacked extension (location UNPACKED) in ${file}`)); continue; }
+      if (loc === LOC.COMMAND_LINE) { out.push(miss(`prefs_command_line:${shown}`, X, `${shown} was loaded from the command line (location COMMAND_LINE) in ${file}`)); continue; }
+      const path = typeof e.path === "string" ? e.path : null;
+      if (id === allowed) {
+        if (loc !== LOC.INTERNAL) { out.push(miss(`prefs_location:${shown}:${loc === null ? "none" : LOCATION_NAMES[loc] ?? loc}`, X, `Claude in Chrome isn't at location INTERNAL (a Web Store install) in ${file}`)); continue; }
+        const full = path === null ? null : pathWin32.isAbsolute(path) || path.startsWith("/") ? path : join(extRoot, path);
+        // The entry's own path in an odd form (8.3, \\?\, UNC) refuses; the profile's folder is install.json's, checked elsewhere.
+        if (!full || !path || oddForm(path) || !inside(full, join(extRoot, id))) out.push(miss(`prefs_path:${shown}`, X, `Claude in Chrome's path in ${file} isn't inside Extensions\\${id}`));
+      } else if (builtins.has(id)) {
+        if (loc === null || !EDGE_COMPONENT_LOCATIONS.includes(loc)) { out.push(miss(`prefs_location:${shown}:${loc === null ? "none" : LOCATION_NAMES[loc] ?? loc}`, X, `the built-in ${shown} isn't at a component location in ${file}`)); continue; }
+        if (!path || !edgeApp || oddForm(path) || !inside(path, edgeApp)) out.push(miss(`prefs_path:${shown}`, X, `the built-in ${shown}'s path in ${file} isn't inside Edge's Application folder`));
+      } else if (loc !== null && EDGE_COMPONENT_LOCATIONS.includes(loc)) {
+        out.push(miss(`component_unknown:${shown}`, X, `${shown} is an Edge component the setup record doesn't list: run dump-extensions on Edge and record-builtins, after checking it is Edge's own`));
+      } else out.push(miss(`prefs_unknown_id:${shown}`, X, `${shown} is an extension other than Claude in Chrome in ${file}`));
+    }
+  }
+  return dedupe(out);
+}
+export interface EdgeDiskReads { list: (d: string) => string[] | null; read: (p: string) => Uint8Array | null; exists: (p: string) => boolean }
+const realEdgeDisk: EdgeDiskReads = { list: (d) => { try { return readdirSync(d); } catch { return null; } }, read: readBytes, exists };
+// The rest of the profile: the Extensions folder holding only the allowed id's folder, Local State listing one profile, no
+// DevToolsActivePort file, and the folder written as the disk lists it with no reparse point on the way (Disk.cased and
+// Disk.reparse, where the disk can tell).
+export function edgeProfileItems(inst: Install, rec: EdgeSetup, edgeApp: string | null, dr: EdgeDiskReads = realEdgeDisk, disk: Disk = diskNow()): EdgeMiss[] {
+  const out: EdgeMiss[] = [];
+  const udd = inst.profile.user_data_dir;
+  const ext = join(udd, inst.profile.profile_directory, "Extensions");
+  if (disk.cased && !disk.cased(resolve(udd))) out.push(miss("udd_case", "untrusted_config", "the jobs user data folder isn't written in install.json as the disk lists it"));
+  if (disk.reparse) for (const p of [udd, join(udd, inst.profile.profile_directory), ext]) if (disk.reparse(p) === true) out.push(miss(`udd_reparse:${basename(p)}`, "untrusted_config", `${p} is a junction or symbolic link`));
+  const names = dr.list(ext);
+  if (names === null) out.push(miss("extensions_folder_unreadable", "wrong_profile", "the jobs profile's Extensions folder can't be listed (install Claude in Chrome from the Web Store first)"));
+  else {
+    for (const n of names) if (n !== inst.profile.extension_id) out.push(miss(`extensions_folder:${/^[\w.-]{1,64}$/.test(n) ? n : "unnamed"}`, "extra_extension", `the jobs profile's Extensions folder holds ${n}, which isn't Claude in Chrome's folder`));
+    if (!names.includes(inst.profile.extension_id)) out.push(miss("extensions_folder_missing", "wrong_profile", "Claude in Chrome's folder isn't in the jobs profile's Extensions folder"));
+  }
+  out.push(...edgePrefsItems(inst, rec, edgeApp, dr.read));
+  const ls = dr.read(join(udd, "Local State"));
+  let profiles: string[] | null = null;
+  try { const j = ls ? JSON.parse(Buffer.from(ls).toString("utf8")) : null; const c = j?.profile?.info_cache; profiles = c && typeof c === "object" && !Array.isArray(c) ? Object.keys(c) : null; } catch { profiles = null; }
+  if (!profiles) out.push(miss("local_state_unreadable", "edge_profiles", "the jobs Edge's Local State can't be read or lists no profiles"));
+  else if (profiles.length !== 1 || profiles[0] !== inst.profile.profile_directory) out.push(miss(`local_state_profiles:${profiles.length}`, "edge_profiles", `the jobs Edge lists ${profiles.length} profiles; it must list exactly one, ${inst.profile.profile_directory}`));
+  if (dr.exists(join(udd, "DevToolsActivePort"))) out.push(miss("devtools_port_file", "devtools_port_file", "a DevToolsActivePort file is in the jobs user data folder: something opened a debugging port on it"));
+  return out;
+}
+// Edge's install: no default_apps that would seed an extension, no initial_preferences (or master_preferences) that would.
+export function edgeSeedItems(edgeApp: string | null, dr: EdgeDiskReads = realEdgeDisk): EdgeMiss[] {
+  if (!edgeApp) return [];
+  const out: EdgeMiss[] = [];
+  const versions = (dr.list(edgeApp) ?? []).filter((d) => /^\d+(\.\d+){3}$/.test(d));
+  for (const d of [join(edgeApp, "default_apps"), ...versions.map((v) => join(edgeApp, v, "default_apps"))]) {
+    const l = dr.list(d);
+    if (l && l.length) out.push(miss("seed:default_apps", "extra_extension", `${d} holds files that would seed extensions`));
+  }
+  for (const n of ["initial_preferences", "master_preferences"]) {
+    const b = dr.read(join(edgeApp, n));
+    if (!b) continue;
+    let j: any = null;
+    try { j = JSON.parse(Buffer.from(b).toString("utf8")); } catch { j = null; }
+    if (!j || typeof j !== "object" || "extensions" in j || "default_apps" in j || "external_extensions" in j) out.push(miss(`seed:${n}`, "extra_extension", `Edge's ${n} would seed extensions (or doesn't parse)`));
+  }
+  return dedupe(out);
+}
+// The external extensions key (Software\Microsoft\Edge\Extensions): empty or absent in both hives and both views.
+export function edgeExternalItems(sys: EdgeSys): EdgeMiss[] {
+  const out: EdgeMiss[] = [];
+  for (const hive of ["HKCU", "HKLM"]) for (const v of VIEWS) {
+    const r = readTree(sys.reg, `${hive}\\${EDGE_EXTERNAL_KEY}`, v.flag);
+    if (r.state === "unreadable") out.push(miss(`external_key_unreadable:${hive}${v.name}`, "extra_extension", `${hive}\\${EDGE_EXTERNAL_KEY} couldn't be read (${v.flag})`));
+    else if (r.state === "tree" && (Object.keys(r.tree).some(Boolean) || Object.keys(r.tree[""] ?? {}).length))
+      out.push(miss(`external_key:${hive}${v.name}`, "extra_extension", `${hive}\\${EDGE_EXTERNAL_KEY} lists an extension for Edge to install (${v.flag})`));
+  }
+  return out;
+}
+// The whole pre-launch gate, in order: the record, the browser, the policies, the host, the external key, the seeds, the
+// profile, and no Edge already on the jobs folder. Every miss is returned, each by name; the first one's code refuses.
+export function edgeGate(o: Opts, inst: Install): EdgeMiss[] {
+  if (jobsBrowser(inst) !== "edge") return [miss("browser_not_edge", "browser_not_edge", BROWSER_NOT_EDGE_HINT)];
+  const rec = readEdgeSetup(o);
+  if (!rec) return [miss("edge_setup_missing", "edge_setup_missing", "edge-setup.json is missing or doesn't parse: run edge-setup")];
+  if (rec.edge_daily_use) return [miss("edge_daily_use", "edge_setup_missing", "setup recorded that you use Edge for your own browsing: the Edge policies would reach it, so jobs don't run in Edge")];
+  if (rec.extension_id !== inst.profile.extension_id) return [miss("edge_setup_extension", "edge_setup_missing", "the setup record names another extension id than install.json")];
+  const want = edgePolicies(rec.extension_id, rec.host_name);
+  if (JSON.stringify(rec.policies) !== JSON.stringify(want)) return [miss("edge_setup_policies", "edge_setup_missing", "the setup record's policies aren't this version's: run edge-setup again")];
+  if (normalPath(inst.native_host_manifest) !== normalPath(rec.manifest_path)) return [miss("host_install_json", "edge_host_mismatch", "install.json's native_host_manifest must name the Edge host's manifest the setup recorded (in the admin-only folder)")];
+  const udd = inst.profile.user_data_dir;
+  if (normDir(dirname(resolve(udd))) !== normDir(o.home)) return [miss("udd_not_in_home", "untrusted_config", "the jobs user data folder must be a folder directly in the worker's folder (beside the Chrome one)")];
+  const found = o.edgeExe !== undefined ? (o.edgeExe ? { exe: o.edgeExe } : { refuse: "edge_missing" as const, why: "no msedge.exe" }) : edgeExe(envOf(o), o.has ?? existsSync);
+  if ("refuse" in found) return [miss(found.refuse, "edge_not_found", found.why)];
+  const app = pathWin32.dirname(found.exe);
+  const sys = sysOf(o);
+  const out = [...edgePolicyItems(sys, rec), ...edgeHostItems(sys, rec), ...edgeExternalItems(sys), ...edgeSeedItems(app, o.edgeDisk ?? realEdgeDisk),
+    ...edgeProfileItems(inst, rec, app, o.edgeDisk ?? realEdgeDisk)];
+  if (sys.running(udd)) out.push(miss("edge_running", "edge_already_open", "an Edge is already running on the jobs folder: close every window of the Cain jobs Edge (check no msedge.exe with its folder is left); the worker starts it itself"));
+  return out;
+}
+export function edgeGateDetail(ms: EdgeMiss[]): string { return ms.map((m) => `${m.item}: ${m.line}`).join("; "); }
+export function edgeGateOrThrow(o: Opts, inst: Install): void {
+  const ms = edgeGate(o, inst);
+  if (!ms.length) return;
+  try { appendFileSync(P.log(o), `${clock(o).toISOString()} edge_gate ${ms.map((m) => m.item).join(",")}\n`); } catch { /* never stops the refusal */ }
+  throw new WorkerError(ms[0].code, { items: ms.map((m) => m.item), fix: edgeGateDetail(ms) });
+}
+
+// ---- The pipe and the DevTools protocol over it (item 4) ------------------------------------------------------------
+// What the worker holds of the pipe: bytes out, bytes in, and its end. Edge reads commands from descriptor 3 and writes its
+// answers to descriptor 4, each message JSON ended by a NUL byte.
+export interface PipeIo { write(data: Uint8Array): void; onData(cb: (d: Uint8Array) => void): void; onClose(cb: () => void): void; close(): void }
+export class Cdp {
+  seq = 0;
+  buf = Buffer.alloc(0);
+  waiting = new Map<number, { ok: (v: any) => void; no: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  lost: string | null = null;
+  io: PipeIo;
+  constructor(io: PipeIo) {
+    this.io = io;
+    io.onData((d) => this.take(d));
+    io.onClose(() => this.drop("the pipe to Edge closed"));
+  }
+  take(d: Uint8Array) {
+    this.buf = Buffer.concat([this.buf, Buffer.from(d)]);
+    if (this.buf.length > 16_000_000) { this.drop("Edge sent more than the worker reads"); return; }
+    for (let i = this.buf.indexOf(0); i >= 0; i = this.buf.indexOf(0)) {
+      const text = this.buf.subarray(0, i).toString("utf8");
+      this.buf = this.buf.subarray(i + 1);
+      let m: any = null;
+      try { m = JSON.parse(text); } catch { continue; }
+      if (typeof m?.id === "number" && this.waiting.has(m.id)) {
+        const w = this.waiting.get(m.id)!;
+        this.waiting.delete(m.id);
+        clearTimeout(w.timer);
+        if (m.error) w.no(new Error(`cdp ${m.error.message ?? "error"}`)); else w.ok(m.result ?? {});
+      }
+    }
+  }
+  drop(why: string) {
+    if (!this.lost) this.lost = why;
+    for (const [, w] of this.waiting) { clearTimeout(w.timer); w.no(new Error(why)); }
+    this.waiting.clear();
+  }
+  send(method: string, params: Record<string, unknown> = {}, sessionId?: string, ms = 10_000): Promise<any> {
+    if (this.lost) return Promise.reject(new Error(this.lost));
+    const id = ++this.seq;
+    return new Promise((ok, no) => {
+      const timer = setTimeout(() => { this.waiting.delete(id); no(new Error(`cdp ${method} timed out`)); }, ms);
+      this.waiting.set(id, { ok, no, timer });
+      try { this.io.write(Buffer.from(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0", "utf8")); }
+      catch { this.drop("the pipe to Edge couldn't be written"); }
+    });
+  }
+  close() { this.drop("closed by the worker"); try { this.io.close(); } catch { /* already gone */ } }
+}
+
+// ---- The effective policy, read in the running Edge ---------------------------------------------------------------
+// edge://policy's table, as text: either its JSON export (Chromium's shape: policyValues.<browser>.policies.<name> with
+// value, source, scope, level and error, warning or conflicts) or the rendered table, read as document text. The rendered
+// table is read in either form a row can take as text: one line with its cells separated by tabs (name, value, source,
+// applies to, level, status), or the name on its own line with those cells on the lines after it.
+export interface PolicyRow { value: string; source: string; scope: string; level: string; status: string; text: string }
+export type PolicyTable = { rows: Record<string, PolicyRow> } | { unrecognised: string };
+const SOURCES = ["Platform", "Cloud", "Default", "Merged", "Enterprise default", "Command line", "Precedence", "Local override", "Platform user"];
+export function parsePolicyTable(text: string, names: readonly string[]): PolicyTable {
+  if (typeof text !== "string" || !text.trim()) return { unrecognised: "the policy page's text was empty" };
+  try {
+    const j = JSON.parse(text);
+    const groups = j?.policyValues && typeof j.policyValues === "object" ? Object.values<any>(j.policyValues) : null;
+    if (groups) {
+      const rows: Record<string, PolicyRow> = {};
+      for (const g of groups) for (const [n, p] of Object.entries<any>(g?.policies ?? {})) {
+        const cap = (s: unknown) => typeof s === "string" && s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : "";
+        const bad = [p?.error, p?.warning].filter((x) => typeof x === "string" && x);
+        rows[n] = { value: JSON.stringify(p?.value), source: cap(p?.source), scope: cap(p?.scope), level: cap(p?.level),
+          status: bad.length || (Array.isArray(p?.conflicts) && p.conflicts.length) || p?.ignored ? "Error" : "OK",
+          text: JSON.stringify(p) };
+      }
+      return { rows };
+    }
+  } catch { /* the rendered table */ }
+  const lines = text.split(/\r?\n/).map((l) => l.replace(/\s+$/, ""));
+  if (!lines.some((l) => /policy name/i.test(l)) || !lines.some((l) => /\bstatus\b/i.test(l))) return { unrecognised: "the page isn't the policy table (no Policy name and Status headings)" };
+  const rows: Record<string, PolicyRow> = {};
+  for (const n of names) {
+    const i = lines.findIndex((l) => l.split("\t")[0].trim() === n);
+    if (i < 0) continue;
+    let cells = lines[i].split("\t").map((c) => c.trim());
+    let end = i + 1;
+    if (cells.length < 6) {
+      cells = [n];
+      for (let k = i + 1; k < lines.length && cells.length < 6; k++) { if (lines[k].trim()) cells.push(lines[k].trim()); end = k + 1; }
+    }
+    // The block runs to the next known policy name or heading: conflict and error lines show there.
+    let stop = end;
+    while (stop < lines.length && !names.includes(lines[stop].split("\t")[0].trim()) && stop - end < 12) stop++;
+    rows[n] = { value: cells[1] ?? "", source: cells[2] ?? "", scope: cells[3] ?? "", level: cells[4] ?? "", status: cells[5] ?? "", text: lines.slice(i, stop).join("\n") };
+  }
+  return { rows };
+}
+// A value as the table shows it, against the record's: a list as JSON or comma-separated, a boolean as true or false.
+export function policyValueIs(shown: string, want: PolicyValue): boolean {
+  const s = shown.trim();
+  if (typeof want === "boolean") return s.toLowerCase() === String(want);
+  let list: unknown = null;
+  try { list = JSON.parse(s); } catch { list = s ? s.split(",").map((x) => x.trim()).filter(Boolean) : []; }
+  return Array.isArray(list) && list.length === want.length && want.every((x, i) => list![i as keyof typeof list] === x);
+}
+const NEEDS_MANAGEMENT = /managed|management|enrol|domain[- ]joined|azure ad|microsoft entra/i;
+export function effectiveItems(table: PolicyTable, rec: EdgeSetup): EdgeMiss[] {
+  const E = "edge_policy_not_effective" as const;
+  if ("unrecognised" in table) return [miss("policy_table_unrecognised", E, table.unrecognised)];
+  const out: EdgeMiss[] = [];
+  for (const [n, want] of Object.entries(rec.policies)) {
+    const r = table.rows[n];
+    if (!r) { out.push(miss(`effective_missing:${n}`, E, `edge://policy doesn't list ${n}: Edge isn't applying it`)); continue; }
+    if (r.status !== "OK" && NEEDS_MANAGEMENT.test(r.text)) { out.push(miss(`effective_needs_management:${n}`, E, `Edge says ${n} needs a managed (enrolled) machine: this design's fallback, the same policies on Chrome under its own key, is a later piece`)); continue; }
+    if (r.source !== "Platform") out.push(miss(`effective_source:${n}`, E, `${n}'s source is ${JSON.stringify(r.source)}, not Platform`));
+    if (r.scope !== "Machine") out.push(miss(`effective_scope:${n}`, E, `${n} applies to ${JSON.stringify(r.scope)}, not Machine`));
+    if (r.level !== "Mandatory") out.push(miss(`effective_level:${n}`, E, `${n}'s level is ${JSON.stringify(r.level)}, not Mandatory`));
+    if (r.status !== "OK") out.push(miss(`effective_status:${n}`, E, `${n}'s status is ${JSON.stringify(r.status)}, not OK`));
+    if (/conflict|superseded/i.test(r.text)) out.push(miss(`effective_conflict:${n}`, E, `${n} shows a conflict`));
+    if (!policyValueIs(r.value, want)) out.push(miss(`effective_value:${n}`, E, `${n}'s value is ${JSON.stringify(r.value.slice(0, 80))}, not the recorded ${JSON.stringify(want)}`));
+  }
+  return out;
+}
+
+// ---- Starting the jobs Edge and checking it (items 3 and 4) -------------------------------------------------------
+// What a launch hands back: Edge's process id, the worker's two ends as a PipeIo, and the four handle values the handle scan
+// compares against (the worker's two, valid in the worker, and Edge's two, valid in Edge).
+export interface PipeRefs { worker_read: string; worker_write: string; edge_read: string; edge_write: string }
+export interface EdgeLaunched { pid: number; io: PipeIo; refs: PipeRefs | null }
+export type EdgeLauncher = (o: Opts, exe: string, args: string[]) => Promise<EdgeLaunched>;
+export interface JobsEdge { pid: number; exe: string; cdp: Cdp; refs: PipeRefs | null; version: string }
+let liveEdge: JobsEdge | null = null;
+export const jobsEdgeNow = () => liveEdge;
+// What launchSession checks while the jobs Edge runs (set by startJobsEdge, cleared by stopJobsEdge).
+let edgeScan: ((pid: number, when: "start" | "end") => string | null) | null = null;
+let edgeLostNow: () => string | null = () => null;
+// Only page targets are closed, never the browser's own (service workers, the extension's background, the browser target).
+export async function closePageTargets(cdp: Cdp, keep: string[] = []): Promise<number> {
+  const t = await cdp.send("Target.getTargets");
+  let n = 0;
+  for (const x of t?.targetInfos ?? []) if (x?.type === "page" && !keep.includes(x.targetId)) { await cdp.send("Target.closeTarget", { targetId: x.targetId }); n++; }
+  return n;
+}
+// The handshake against the spawned process: Browser.getVersion says Edge, and the process list shows that very process id
+// running the msedge.exe the worker started, on the jobs folder, with the pipe switch and none of the forbidden ones.
+export function handshakeItems(product: unknown, pid: number, exe: string, inst: Install, ps: Proc[] | null): EdgeMiss[] {
+  const E = "edge_launch_failed" as const;
+  const out: EdgeMiss[] = [];
+  if (typeof product !== "string" || !/^Edg\//.test(product)) out.push(miss("handshake_not_edge", E, `the browser on the pipe says ${JSON.stringify(String(product).slice(0, 60))}, not Edge`));
+  const p = ps?.find((x) => x.pid === pid) ?? null;
+  if (!ps) out.push(miss("handshake_procs_unreadable", E, "the process list couldn't be read to check the launched Edge"));
+  else if (!p) out.push(miss("handshake_pid", E, `no process ${pid} (the Edge the worker started) is running`));
+  else {
+    const named = (p.exe ?? "").trim() || splitCmd(p.cmd)?.exe || "";
+    if (normExe(named) !== normExe(exe)) out.push(miss("handshake_exe", E, `process ${pid} isn't the msedge.exe the worker started`));
+    if (!sameProfileDir(p.cmd, inst.profile.user_data_dir)) out.push(miss("handshake_folder", E, `process ${pid} isn't on the jobs user data folder`));
+    const words = argWords(splitCmd(p.cmd)?.rest ?? "").map((w) => w.replace(/"/g, "").split("=")[0].toLowerCase());
+    if (!words.includes(EDGE_PIPE_SWITCH)) out.push(miss("handshake_switch", E, `process ${pid} wasn't started with ${EDGE_PIPE_SWITCH}`));
+    for (const f of EDGE_FORBIDDEN_SWITCHES) if (words.includes(f)) out.push(miss(`handshake_forbidden:${f.slice(2)}`, E, `process ${pid} carries ${f}`));
+  }
+  return out;
+}
+export async function readPolicyPage(cdp: Cdp, ms = 15_000, sleepMs = 200): Promise<string> {
+  const { targetId } = await cdp.send("Target.createTarget", { url: "edge://policy" });
+  try {
+    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+    const evalText = async (expression: string) => (await cdp.send("Runtime.evaluate", { expression, returnByValue: true }, sessionId))?.result?.value;
+    const until = Date.now() + ms;
+    let text = "";
+    while (Date.now() < until) {
+      if (await evalText("document.readyState") === "complete") {
+        const t = await evalText("document.body ? document.body.innerText : ''");
+        text = typeof t === "string" ? t : "";
+        if (EDGE_POLICY_NAMES.some((n) => text.includes(n))) break;
+      }
+      await new Promise((r) => setTimeout(r, sleepMs));
+    }
+    return text;
+  } finally { await cdp.send("Target.closeTarget", { targetId }).catch(() => null); }
+}
+export async function startJobsEdge(o: Opts, inst: Install): Promise<JobsEdge> {
+  edgeGateOrThrow(o, inst);
+  const rec = readEdgeSetup(o)!;
+  const found = o.edgeExe ? { exe: o.edgeExe } : edgeExe(envOf(o), o.has ?? existsSync);
+  if ("refuse" in found) throw new WorkerError("edge_not_found", found.why);
+  const args = edgeLaunchArgs(inst);
+  let launched: EdgeLaunched;
+  try { launched = await (o.edgeLaunch ?? edgeLaunchHelper)(o, found.exe, args); }
+  catch (e) { if (e instanceof WorkerError) throw e; throw new WorkerError("edge_launch_failed", "the worker's helper couldn't start Edge with the pipe"); }
+  const cdp = new Cdp(launched.io);
+  const fail = async (code: Code, detail: unknown): Promise<never> => {
+    try { await cdp.send("Browser.close", {}, undefined, 5_000); } catch { /* it may be gone */ }
+    cdp.close();
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} edge_refused ${code}\n`); } catch { /* never stops the refusal */ }
+    throw new WorkerError(code, detail);
+  };
+  let product: unknown = null;
+  try { product = (await cdp.send("Browser.getVersion"))?.product; } catch { return fail("edge_pipe_lost", "Edge didn't answer on the pipe"); }
+  const hs = handshakeItems(product, launched.pid, found.exe, inst, sysOf(o).procs());
+  if (hs.length) return fail(hs[0].code, { items: hs.map((m) => m.item), fix: edgeGateDetail(hs) });
+  if ((o.edgeDisk ?? realEdgeDisk).exists(join(inst.profile.user_data_dir, "DevToolsActivePort"))) return fail("devtools_port_file", "a DevToolsActivePort file appeared in the jobs user data folder");
+  let text = "";
+  try { text = await readPolicyPage(cdp, o.edgePolicyMs ?? 15_000, o.edgePolicyMs ? 1 : 200); } catch { return fail(cdp.lost ? "edge_pipe_lost" : "edge_policy_not_effective", "edge://policy couldn't be read over the pipe"); }
+  const eff = effectiveItems(parsePolicyTable(text, Object.keys(rec.policies)), rec);
+  if (eff.length) return fail(eff[0].code, { items: eff.map((m) => m.item), fix: edgeGateDetail(eff) });
+  liveEdge = { pid: launched.pid, exe: found.exe, cdp, refs: launched.refs, version: String(product) };
+  edgeScan = (pid, when) => pipeLeakWhy(o, pid, when);
+  edgeLostNow = () => edgeLostWhy(o);
+  try { appendFileSync(P.log(o), `${clock(o).toISOString()} edge_started ${launched.pid} ${String(product).replace(/\s/g, "_")} policy_ok\n`); } catch { /* a log line only */ }
+  return liveEdge;
+}
+// The browser shut down at the end of a run, a probe or a bind: the pipe stays open until then.
+export async function stopJobsEdge(): Promise<void> {
+  const e = liveEdge;
+  liveEdge = null;
+  edgeScan = null;
+  edgeLostNow = () => null;
+  if (!e) return;
+  try { await e.cdp.send("Browser.close", {}, undefined, 10_000); } catch { /* it may be gone */ }
+  e.cdp.close();
+}
+// Whether the run must stop: the pipe lost, or Edge's process gone.
+export function edgeLostWhy(o: Opts): string | null {
+  const e = liveEdge;
+  if (!e) return null;
+  if (e.cdp.lost) return e.cdp.lost;
+  const ps = sysOf(o).procs();
+  return ps && !ps.some((p) => p.pid === e.pid) ? `Edge's process ${e.pid} is gone` : null;
+}
+
+// ---- The launch on Windows: pcw-jobrun edge-launch (jobrun.cs) ------------------------------------------------------
+// Bun's spawn (libuv) does pass extra descriptors in STARTUPINFO's lpReserved2, but it calls CreateProcess with every
+// inheritable handle of the worker inherited and has no PROC_THREAD_ATTRIBUTE_HANDLE_LIST: the pcjobs-windows tests show
+// both (the launch prototype). So the launch is the helper's, a few lines of C# compiled on the PC like the Job Object
+// helper: it makes both pipes non-inheritable, makes Edge's two ends inheritable only for the one CreateProcess call that
+// lists exactly those two in PROC_THREAD_ATTRIBUTE_HANDLE_LIST and passes them as CRT descriptors 3 and 4 in lpReserved2
+// (Edge's runtime turns them into handles; no raw handle value is passed on the command line), closes its copies of Edge's
+// ends at once, and hands the worker's two ends back by DuplicateHandle into the worker's process (by its process id, which
+// must be the helper's parent), not inheritable. It prints one line: {"pid":..,"read":..,"write":..,"edge_read":..,"edge_write":..}.
+// The call is synchronous (spawnSync), so no other spawn of the worker runs while it does; the CLI starts after it.
+export async function edgeLaunchHelper(o: Opts, exe: string, args: string[]): Promise<EdgeLaunched> {
+  if (platform(o) !== "win32") throw new WorkerError("edge_launch_failed", "Edge is launched on Windows only");
+  const helper = ensureJobHelper(o);
+  if (!helper) throw new WorkerError(jobHelperState(o).code ?? "containment_unavailable");
+  const r = spawnSync(helper, ["edge-launch", String(process.pid), exe, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, windowsHide: true });
+  const j = (() => { try { return JSON.parse((r.stdout ?? "").trim()); } catch { return null; } })();
+  const H = /^\d{1,20}$/;
+  if (r.status !== 0 || !j || !Number.isInteger(j.pid) || ![j.read, j.write, j.edge_read, j.edge_write].every((h) => typeof h === "string" && H.test(h)))
+    throw new WorkerError("edge_launch_failed", `the helper's edge-launch answered ${r.status ?? "nothing"}`);
+  return { pid: j.pid, io: await winPipeIo(BigInt(j.read), BigInt(j.write)), refs: { worker_read: j.read, worker_write: j.write, edge_read: j.edge_read, edge_write: j.edge_write } };
+}
+// The worker's two ends, through kernel32 (bun:ffi): PeekNamedPipe polls for bytes so the event loop never blocks on a
+// read; a failed peek or read is the pipe lost.
+export async function winPipeIo(readH: bigint, writeH: bigint, pollMs = 15): Promise<PipeIo> {
+  const { dlopen, FFIType } = await import("bun:ffi");
+  const k = dlopen("kernel32.dll", {
+    PeekNamedPipe: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    ReadFile: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    WriteFile: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    CloseHandle: { args: [FFIType.u64], returns: FFIType.i32 },
+  });
+  let data: ((d: Uint8Array) => void) | null = null, closed: (() => void) | null = null, done = false;
+  const avail = new Uint32Array(1), got = new Uint32Array(1);
+  const end = () => { if (done) return; done = true; clearInterval(timer); k.symbols.CloseHandle(readH); k.symbols.CloseHandle(writeH); closed?.(); };
+  const timer = setInterval(() => {
+    if (done) return;
+    avail[0] = 0;
+    if (!k.symbols.PeekNamedPipe(readH, null, 0, null, avail, null)) { end(); return; }
+    if (!avail[0]) return;
+    const buf = new Uint8Array(Math.min(avail[0], 1 << 20));
+    if (!k.symbols.ReadFile(readH, buf, buf.length, got, null)) { end(); return; }
+    data?.(buf.subarray(0, got[0]));
+  }, pollMs);
+  return {
+    write: (d) => { let off = 0; while (off < d.length) { const part = d.subarray(off); got[0] = 0; if (!k.symbols.WriteFile(writeH, part, part.length, got, null) || !got[0]) { end(); throw new Error("pipe write failed"); } off += got[0]; } },
+    onData: (cb) => { data = cb; }, onClose: (cb) => { closed = cb; }, close: end,
+  };
+}
+// The handle scan (pcw-jobrun pipe-scan): every handle of every process in the claude.exe tree compared, as an object, with
+// the pipe's four ends (CompareObjectHandles); any match fails the run (pipe_handle_leak). Run after the CLI starts and at
+// the session's end, while the tree still runs.
+export interface PipeScan { handles: number; hits: { pid: number; handle: string }[]; undup: number }
+export function pipeScan(o: Opts, edge: JobsEdge, pids: number[]): PipeScan | null {
+  if (o.pipeScan) return o.pipeScan(pids);
+  if (platform(o) !== "win32" || !edge.refs || !pids.length) return null;
+  const helper = ensureJobHelper(o);
+  if (!helper) return null;
+  const r = spawnSync(helper, ["pipe-scan", String(process.pid), edge.refs.worker_read, edge.refs.worker_write, String(edge.pid), edge.refs.edge_read, edge.refs.edge_write, "--", ...pids.map(String)],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, windowsHide: true });
+  try { const j = JSON.parse((r.stdout ?? "").trim()); return r.status === 0 && Number.isInteger(j?.handles) && Array.isArray(j?.hits) ? j : null; } catch { return null; }
+}
+// The claude.exe tree: the session's process and every descendant the process list shows.
+export function treeOf(ps: Proc[], root: number): number[] {
+  const out = [root];
+  for (let i = 0; i < out.length; i++) for (const p of ps) if (p.ppid === out[i] && !out.includes(p.pid)) out.push(p.pid);
+  return out;
+}
+// The session's check, at its start and its end: null when no pipe handle is in the tree; the abort's name otherwise. A
+// scan that can't run is a leak for the run (fail closed), named in the log.
+export function pipeLeakWhy(o: Opts, rootPid: number, when: "start" | "end"): string | null {
+  const e = liveEdge;
+  if (!e) return null;
+  const tree = treeOf(sysOf(o).procs() ?? [], rootPid);
+  const s = pipeScan(o, e, tree);
+  const line = s ? `${s.handles} handles, ${s.hits.length} pipe handles, ${s.undup} unreadable` : "the scan couldn't run";
+  try { appendFileSync(P.log(o), `${clock(o).toISOString()} pipe_scan ${when} ${tree.length} processes ${line}\n`); } catch { /* a log line only */ }
+  if (!s && platform(o) !== "win32" && !o.pipeScan) return null;
+  return !s ? "the handle scan couldn't run" : s.hits.length ? `a pipe handle to Edge is in the claude.exe tree (${s.hits.map((h) => h.pid).join(", ")})` : null;
+}
+
+// ---- Setup (item 6): edge-setup, edge-record, record-builtins ---------------------------------------------------------
+// edge-setup (attended): asks once whether the owner uses Edge for his own browsing and records the answer; writes the
+// host's two files as drafts in the worker folder (edge-host\); records the manifest bytes, the wrapper bytes, the wrapper's
+// target (install.json's claude, absolute) and its signer and version; prints the elevated prompt's lines.
+export const EDGE_QUESTION = "Do you use Microsoft Edge for your own browsing on this PC? The Cain jobs policies reach every Edge profile on the machine. Type yes or no, then press Enter.";
+export async function edgeSetup(o: Opts): Promise<{ recorded: string; edge_daily_use: boolean; lines: string[] }> {
+  if (!o.attended) throw new WorkerError("attended_required");
+  const inst = mustInstall(o);
+  if (!filesTrusted(o)) throw new WorkerError("untrusted_files");
+  const target = inst.claude.replace(/\//g, "\\");
+  if (!/^[A-Za-z]:\\[^"%!^&|<>\r\n]+\\claude\.exe$/i.test(target)) throw new WorkerError("untrusted_config", "install.json's claude must be the absolute path of claude.exe, with no character cmd.exe would read as anything but text");
+  const hostName = readJson(inst.native_host_manifest)?.name;
+  if (typeof hostName !== "string" || !HOST_NAME.test(hostName)) throw new WorkerError("untrusted_config", "Claude Code's own host manifest (native_host_manifest) can't be read for its host name");
+  const daily = await (o.confirm ?? askYesNo)(EDGE_QUESTION);
+  const id = (o.edgeSys ?? realEdgeSys(o)).target(target);
+  if (!id || id.status !== "Valid") throw new WorkerError("untrusted_config", `claude.exe's signature at ${target} couldn't be read as valid`);
+  const dir = edgeHostDir(envOf(o));
+  const wrapperPath = pathWin32.join(dir, "host.cmd"), manifestPath = pathWin32.join(dir, `${hostName}.json`);
+  const wrapper = wrapperText(target), manifest = manifestText(hostName, wrapperPath, inst.profile.extension_id);
+  const drafts = join(o.home, "edge-host");
+  mkdirSync(drafts, { recursive: true });
+  const dm = join(drafts, `${hostName}.json`), dw = join(drafts, "host.cmd");
+  writeFileSync(dm, manifest); writeFileSync(dw, wrapper);
+  const old = readEdgeSetup(o);
+  const rec: EdgeSetup = { v: 1, at: clock(o).toISOString(), edge_daily_use: daily, extension_id: inst.profile.extension_id, host_name: hostName,
+    manifest_path: manifestPath, manifest_b64: b64(manifest), wrapper_path: wrapperPath, wrapper_b64: b64(wrapper), target, target_signer: id.signer, target_version: id.version,
+    builtin_ids: old?.builtin_ids ?? [], builtins_at: old?.builtins_at ?? null, policies: edgePolicies(inst.profile.extension_id, hostName) };
+  writeEdgeSetup(o, rec);
+  return { recorded: P.edgeSetup(o), edge_daily_use: daily, lines: daily ? ["rem You use Edge for your own browsing: jobs won't run in Edge (edge_daily_use). Nothing to run."] : edgeSetupLines(rec, { manifest: dm, wrapper: dw }) };
+}
+// edge-record (attended): after a Claude Code auto-update or a Web Store update of the extension, shows the recorded and
+// current claude.exe version and signer (and the extension's folder version) and takes the owner's go before it records them.
+export async function edgeRecord(o: Opts): Promise<{ recorded: boolean; old: TargetIdentity; now: TargetIdentity | null; extension_versions: string[] }> {
+  if (!o.attended) throw new WorkerError("attended_required");
+  const inst = mustInstall(o);
+  const rec = readEdgeSetup(o);
+  if (!rec) throw new WorkerError("edge_setup_missing", "run edge-setup first");
+  const now = (o.edgeSys ?? realEdgeSys(o)).target(rec.target);
+  const old = { signer: rec.target_signer, status: "Valid", version: rec.target_version };
+  const extension_versions = extensionFolders(inst);
+  if (!now || now.status !== "Valid") return { recorded: false, old, now, extension_versions };
+  const go = await (o.confirm ?? askYesNo)(`claude.exe at ${rec.target}: recorded version ${rec.target_version}, signer ${rec.target_signer}; now version ${now.version}, signer ${now.signer}. `
+    + `Claude in Chrome's folder in the jobs Edge holds ${extension_versions.join(", ") || "no version"}. Record these? Type yes or no, then press Enter.`);
+  if (!go) return { recorded: false, old, now, extension_versions };
+  writeEdgeSetup(o, { ...rec, at: clock(o).toISOString(), target_signer: now.signer, target_version: now.version });
+  return { recorded: true, old, now, extension_versions };
+}
+// record-builtins (attended): the component ids the jobs Edge profile lists (location 5 or 10, path inside Edge's
+// Application folder), shown, recorded on the owner's go.
+export function edgeComponents(inst: Install, edgeApp: string | null, read: (p: string) => Uint8Array | null = readBytes): { id: string; location: number; name: string | null; inside: boolean }[] {
+  const out = new Map<string, { id: string; location: number; name: string | null; inside: boolean }>();
+  for (const f of ["Preferences", "Secure Preferences"]) {
+    const b = read(join(inst.profile.user_data_dir, inst.profile.profile_directory, f));
+    let j: any = null;
+    try { j = b ? JSON.parse(Buffer.from(b).toString("utf8")) : null; } catch { j = null; }
+    for (const [id, e] of Object.entries<any>(j?.extensions?.settings ?? {}))
+      if (/^[a-p]{32}$/.test(id) && EDGE_COMPONENT_LOCATIONS.includes(e?.location))
+        out.set(id, { id, location: e.location, name: typeof e?.manifest?.name === "string" ? e.manifest.name.slice(0, 60) : null, inside: typeof e?.path === "string" && !!edgeApp && inside(e.path, edgeApp) });
+  }
+  return [...out.values()].sort((a, b) => a.id < b.id ? -1 : 1);
+}
+export async function recordBuiltins(o: Opts): Promise<{ recorded: string[] | null; seen: ReturnType<typeof edgeComponents> }> {
+  if (!o.attended) throw new WorkerError("attended_required");
+  const inst = mustInstall(o);
+  const rec = readEdgeSetup(o);
+  if (!rec) throw new WorkerError("edge_setup_missing", "run edge-setup first");
+  const found = o.edgeExe ? { exe: o.edgeExe } : edgeExe(envOf(o), o.has ?? existsSync);
+  const app = "exe" in found ? pathWin32.dirname(found.exe) : null;
+  const seen = edgeComponents(inst, app);
+  const ok = seen.filter((c) => c.inside);
+  if (!ok.length) return { recorded: null, seen };
+  const go = await (o.confirm ?? askYesNo)(`The jobs Edge lists these components inside Edge's Application folder: ${ok.map((c) => `${c.id} (${c.name ?? "no name"})`).join(", ")}. Record them as Edge's own? Type yes or no, then press Enter.`);
+  if (!go) return { recorded: null, seen };
+  writeEdgeSetup(o, { ...rec, builtin_ids: ok.map((c) => c.id), builtins_at: clock(o).toISOString() });
+  return { recorded: ok.map((c) => c.id), seen };
+}
+// open-edge (attended, setup step 3): the jobs Edge on its folder and profile, without the pipe, for the owner to install
+// Claude in Chrome from the Web Store once. It refuses while that Edge runs; the worker starts every later one itself.
+export const edgeOpenArgs = (inst: Install): string[] => edgeLaunchArgs(inst).filter((a) => a !== EDGE_PIPE_SWITCH);
+export function openEdge(o: Opts): { started: string; args: string[] } {
+  if (!o.attended) throw new WorkerError("attended_required");
+  const inst = mustInstall(o);
+  if (jobsBrowser(inst) !== "edge") throw new WorkerError("browser_not_edge", BROWSER_NOT_EDGE_HINT);
+  if (sysOf(o).running(inst.profile.user_data_dir)) throw new WorkerError("edge_already_open", "the Cain jobs Edge is already open");
+  const found = o.edgeExe ? { exe: o.edgeExe } : edgeExe(envOf(o), o.has ?? existsSync);
+  if ("refuse" in found) throw new WorkerError("edge_not_found", found.why);
+  const args = edgeOpenArgs(inst);
+  (o.startChrome ?? ((e, a) => { spawn(e, a, { detached: true, stdio: "ignore", windowsHide: false }).unref(); }))(found.exe, args);
+  return { started: found.exe, args };
+}
+// The launcher's one plain line for each Edge refusal.
+export const EDGE_LINES: Partial<Record<string, string>> = {
+  browser_not_edge: "Stopped: jobs run in Edge now. Do the Edge setup steps in pc-jobs.md first. Tell Cain: refusal browser_not_edge.",
+  edge_not_found: "Stopped: the machine's Microsoft Edge wasn't found under Program Files. Tell Cain: refusal edge_not_found.",
+  edge_setup_missing: "Stopped: the Edge setup isn't recorded (or you use Edge yourself). Run edge-setup. Tell Cain: refusal edge_setup_missing.",
+  edge_policy_missing: "Stopped: an Edge policy is missing, wrong or extra. Run check-host to see which. Tell Cain: refusal edge_policy_missing.",
+  edge_host_mismatch: "Stopped: Claude Code's Edge host isn't as recorded (after a Claude Code update, run edge-record). Tell Cain: refusal edge_host_mismatch.",
+  edge_profiles: "Stopped: the Cain jobs Edge has more than one profile, or none. Tell Cain: refusal edge_profiles.",
+  edge_already_open: "Stopped: the Cain jobs Edge is already open. Close it; the worker opens it itself. Tell Cain: refusal edge_already_open.",
+  devtools_port_file: "Stopped: something opened a debugging port on the Cain jobs Edge. Tell Cain: refusal devtools_port_file.",
+  edge_policy_not_effective: "Stopped: Edge isn't applying the jobs policies as set. Tell Cain: refusal edge_policy_not_effective.",
+  edge_pipe_lost: "Stopped: the worker lost its pipe to the Cain jobs Edge. Tell Cain: refusal edge_pipe_lost.",
+  pipe_handle_leak: "Stopped: the Claude Code session held a handle to the Edge pipe. Tell Cain: refusal pipe_handle_leak.",
+  edge_launch_failed: "Stopped: the worker couldn't start the Cain jobs Edge as it must. Tell Cain: refusal edge_launch_failed.",
+};
+
 // confirmed.json, written by confirm-profile from a passing probe.
 // read_context: the probe found this PC's reading tools don't report their tab's address,
 // so every run needs a tab context after each read (endCheck's contextAfterRead).
@@ -2053,9 +3049,11 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // both hooks refuse at once when probe mode shows outside a bound probe session, and read-guard names
 // why a read is unplaced; 20: read-guard's address-field rule counts inside the placement-bearing answer
 // (tool_response) alone and folds keys by NFKC then ASCII lowercase; 21, 0.12.2: the worker file changed for the
-// extension check and the hook's entry points (nav-guard and read-guard themselves unchanged)). The pull request check (check_pr.py) wants it above main's whenever the
+// extension check and the hook's entry points (nav-guard and read-guard themselves unchanged); 22, Cain 0.20.0: the worker
+// file changed for the Edge jobs browser (its gate, its pipe and its policy read), the desktop app's processes and the
+// launcher (nav-guard and read-guard themselves unchanged)). The pull request check (check_pr.py) wants it above main's whenever the
 // guard changed against main, so a rebase over another pull request that touched the guard bumps it again.
-export const POLICY_VERSION = "21";
+export const POLICY_VERSION = "22";
 // The hook bundle (the hook's own code: worker.ts, which holds nav-guard and read-guard, the format
 // it imports and the pinned Public Suffix List) plus the pinned session settings, hashed into every
 // confirmation (0.12.0, nineteenth round): the confirmation binds to what the hook is, not to the
@@ -2102,8 +3100,67 @@ export function readConfirmed(o: Opts): Confirmed | null {
 // missing confirmation (and the pinned hashes it would hold) is checked. The worker
 // never starts Chrome: the dedicated one must already be open on its profile.
 // Chrome's version is read once for the whole preflight (inChromePhase, twenty-second round).
-export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false): Code | null {
-  return inChromePhase(() => preflightChecks(o, inst, bypassConfirm));
+// reuse (Cain 0.19.1): a run's preflight reuses the one reading of Chrome's version its start made for the extension notes.
+// Review round 2: the extension gate is read once more after the extension attaches (the bridge check, in next) and right
+// before the job's session is launched (run). Either reading refusing, or differing in any way from the preflight's (an
+// extension, a path, a state, a policy entry or a file changed in between), refuses as extra_extension. No preflight
+// reading in this process refuses too.
+let gateSeen: { snap: string; version: string | null; udd: string } | null = null;
+const gateSnap = (prefs: ExtensionPrefs) => JSON.stringify({ files: prefs.files, disagree: prefs.disagree, refusals: prefs.refusals, policy: prefs.policy,
+  extensions: prefs.extensions.map((x) => [x.id, x.kind, x.status, x.enabled, x.location, x.state, x.disable_reasons, x.path_kind, x.path ?? null]) });
+// Cain 0.20.0: on Edge the snapshot is edgeSnap's (each entry's id, location, path, state and disable reasons in both
+// preference files, and the Extensions folder's names), taken when the profile items passed.
+export function edgeSnap(o: Opts, inst: Install): string {
+  const dr = o.edgeDisk ?? realEdgeDisk;
+  const prof = join(inst.profile.user_data_dir, inst.profile.profile_directory);
+  const files = ["Preferences", "Secure Preferences"].map((f) => {
+    const b = dr.read(join(prof, f));
+    let j: any = null;
+    try { j = b ? JSON.parse(Buffer.from(b).toString("utf8")) : null; } catch { j = "unparsed"; }
+    return Object.entries<any>(j?.extensions?.settings ?? {}).sort(([a], [b]) => a < b ? -1 : 1).map(([id, e]) => [id, e?.location ?? null, e?.path ?? null, e?.state ?? null, e?.disable_reasons ?? null]);
+  });
+  return JSON.stringify({ files, folder: (dr.list(join(prof, "Extensions")) ?? []).sort() });
+}
+function edgeExtensionGate(o: Opts, inst: Install): Code | null {
+  const rec = readEdgeSetup(o);
+  if (!rec) return "edge_setup_missing";
+  const found = o.edgeExe ? { exe: o.edgeExe } : edgeExe(envOf(o), o.has ?? existsSync);
+  const app = "exe" in found ? pathWin32.dirname(found.exe) : null;
+  // The extension's own entry first, as on Chrome: in neither preference file is extension_entry_missing.
+  const dr = o.edgeDisk ?? realEdgeDisk;
+  const prof = join(inst.profile.user_data_dir, inst.profile.profile_directory);
+  const has = ["Secure Preferences", "Preferences"].some((f) => { const b = dr.read(join(prof, f)); try { return !!b && !!JSON.parse(Buffer.from(b).toString("utf8"))?.extensions?.settings?.[inst.profile.extension_id]; } catch { return false; } });
+  if (!has) return "extension_entry_missing";
+  const items = edgeProfileItems(inst, rec, app, dr).filter((m) => m.code === "extra_extension");
+  if (items.length) {
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} edge_gate ${items.map((m) => m.item).join(",")}\n`); } catch { /* never stops the refusal */ }
+    return "extra_extension";
+  }
+  gateSeen = { snap: edgeSnap(o, inst), version: null, udd: inst.profile.user_data_dir };
+  return null;
+}
+export function gateAgain(o: Opts, inst: Install): Code | null {
+  const seen = gateSeen;
+  if (!seen || seen.udd !== inst.profile.user_data_dir) return "extra_extension";
+  if (jobsBrowser(inst) === "edge") {
+    const rec = readEdgeSetup(o);
+    const found = o.edgeExe ? { exe: o.edgeExe } : edgeExe(envOf(o), o.has ?? existsSync);
+    const app = "exe" in found ? pathWin32.dirname(found.exe) : null;
+    if (!rec || edgeProfileItems(inst, rec, app, o.edgeDisk ?? realEdgeDisk).some((m) => m.code === "extra_extension") || edgeSnap(o, inst) !== seen.snap) {
+      try { appendFileSync(P.log(o), `${clock(o).toISOString()} extension_gate_changed\n`); } catch { /* never stops the refusal */ }
+      return "extra_extension";
+    }
+    return null;
+  }
+  const prefs = extensionPrefs(inst, forcelistOf(o), seen.version);
+  if (!prefs.files.length || prefs.disagree.length || gateRefuses(prefs) || gateSnap(prefs) !== seen.snap) {
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} extension_gate_changed\n`); } catch { /* never stops the refusal */ }
+    return "extra_extension";
+  }
+  return null;
+}
+export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false, reuse = false): Code | null {
+  return inChromePhase(() => preflightChecks(o, inst, bypassConfirm), reuse);
 }
 function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code | null {
   if (inst.unattended) return "unattended_unsupported";
@@ -2113,10 +3170,20 @@ function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code |
   const contained = containmentProblem(o);
   if (contained) return contained;
   // The extension's entry in the profile's preferences, and no other extension on there (a policy one counts whatever its state).
-  const prefs = extensionPrefs(inst, forcelistOf(o));
-  if (!prefs.files.length) return "extension_entry_missing";
-  if (prefs.disagree.length) return "prefs_disagree";
-  if (gateRefuses(prefs)) return "extra_extension";
+  // Chrome's version, this phase's one reading, kept with the gate's snapshot (gateAgain).
+  const gateVersion = chromeVersionRead(o, inst)?.version ?? null;
+  gateSeen = null;
+  if (jobsBrowser(inst) === "edge") {
+    // Cain 0.20.0: the Edge profile's own strict rule (edgeProfileItems), never Chrome's built-in list.
+    const e = edgeExtensionGate(o, inst);
+    if (e) return e;
+  } else {
+    const prefs = extensionPrefs(inst, forcelistOf(o), gateVersion);
+    if (!prefs.files.length) return "extension_entry_missing";
+    if (prefs.disagree.length) return "prefs_disagree";
+    if (gateRefuses(prefs)) return "extra_extension";
+    gateSeen = { snap: gateSnap(prefs), version: gateVersion, udd: inst.profile.user_data_dir };
+  }
   // An extension update unpacked but not yet running, or more than one version folder: held until a new
   // probe (versionHold); the probe itself refuses while either is seen.
   if (bypassConfirm) { if (updatePending(inst)) return "update_pending"; if (extensionFolders(inst).length > 1) return "extension_versions_ambiguous"; }
@@ -2431,7 +3498,8 @@ export async function next(o: Opts): Promise<NextOut> {
     const inst = installOf(o);
     if (typeof inst === "string") return quit(inst);
     // Each extension other than Claude in Chrome and Chrome's own listed with its status (read only: nothing is written to the profile).
-    const exts = extensionNotes(extensionPrefs(inst, forcelistOf(o)));
+    // Chrome's version, read once here; the preflight below reuses this reading.
+    const exts = extensionNotes(extensionPrefs(inst, forcelistOf(o), inChromePhase(() => chromeVersionRead(o, inst))?.version ?? null));
     if (exts.length) st.warnings = [...(st.warnings ?? []), ...exts];
     // Pop-ups and redirects allowed in the dedicated profile: a warning, never a stop.
     const pw = popupWarning(inst);
@@ -2463,7 +3531,11 @@ export async function next(o: Opts): Promise<NextOut> {
     let run: Job | null = null;
     let code: Heartbeat["code"] = "idle";
     if (candidate) {
-      const pre = browserPreflight(o, inst) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o) ?? await bridgeCheck(o, inst);
+      // Cain 0.20.0: a job runs in the jobs Edge only. The pre-launch gate, the launch with the pipe, the handshake and the
+      // effective policy read come first; Edge stays open, on the worker's pipe, until the run ends (run stops it).
+      const edge = await edgeFirst(o, inst);
+      const pre = edge ?? browserPreflight(o, inst, false, true) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o, inst) ?? await bridgeCheck(o, inst) ?? gateAgain(o, inst)
+        ?? (edgeLostWhy(o) ? "edge_pipe_lost" : null);
       if (pre === "probe_stale") st.reason = inChromePhase(() => staleReason(o, inst), true);     // the preflight's own reading
       if (pre === "extension_version_unknown") st.reason = "extension_version_unknown";
       if (pre) code = pre;
@@ -2480,13 +3552,28 @@ export async function next(o: Opts): Promise<NextOut> {
       commitPush(o, parts.filter(Boolean).join("; "));
     }
     keep = !!run;
+    if (!run) await stopJobsEdge();
     return { claim: run ? { job: run, inst, allow: allow.ok ? allow.value : [], claimedAt: mono(o), st } : null, closed, code };
   } catch (e) {
+    await stopJobsEdge();
     if (e instanceof WorkerError && e.code === "git_failed") return quit("git_failed");
     if (e instanceof WorkerError && SESSION_FAILURES.includes(e.code)) return quit(e.code as Code);
     throw e;
   } finally {
     if (!keep) unlock(o);
+  }
+}
+// The jobs Edge before a job (next): its code when it refuses (browser_not_edge on a Chrome install), null once it runs.
+// The refusal's items are kept in the log and in edgeRefusal, for the run's detail line.
+let edgeRefusal: string | null = null;
+export async function edgeFirst(o: Opts, inst: Install): Promise<Code | null> {
+  edgeRefusal = null;
+  try { await startJobsEdge(o, inst); return null; }
+  catch (e) {
+    if (!(e instanceof WorkerError) || !(CODES as readonly string[]).includes(e.code)) throw e;
+    const d: any = e.detail;
+    edgeRefusal = typeof d === "string" ? d : typeof d?.fix === "string" ? d.fix : null;
+    return e.code as Code;
   }
 }
 
@@ -3034,7 +4121,8 @@ export function markerSession(dir: string, token: string): string | null {
 // confirmation. The probe's kill_latency step measures that escalation on this PC.
 // hook_margin_low (0.12.0, twentieth round): the worker's own abort, never a hook's, for a real run whose
 // hook started so late that under HOOK_GAP_MARGIN_MS of the timeout was left past the budget (lateHook).
-export const ABORT_CODES = ["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low", "nav_log_unset"] as const;
+export const ABORT_CODES = ["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low", "nav_log_unset",
+  "edge_pipe_lost", "pipe_handle_leak"] as const;   // Cain 0.20.0: the jobs Edge's pipe lost, or a handle to it in the claude.exe tree
 export type AbortCode = typeof ABORT_CODES[number];
 export const ABORT_POLL_MS = 100;
 // read-guard's hold: with its input deadline (HOOK_MS), below the settings' hook timeout
@@ -4033,8 +5121,9 @@ export function guardCheck(st: Stream, log: Decision[], paths: string[] = [], to
 // the worker's lock can't see it: any is chrome_busy, and so is a process list that can't
 // be read. The extension's native messaging host is not a session and doesn't count.
 // created: when the process started, in ms since the epoch (null when it can't be read);
-// cmd: its command line, "" when the system won't show it.
-export interface Proc { pid: number; cmd: string; ppid?: number; created?: number | null }
+// cmd: its command line, "" when the system won't show it. name and exe (Cain 0.19.1, review round 1): its image name
+// (claude.exe) and executable path, as Windows lists them ("" when it won't show them; absent elsewhere and in older stand-ins).
+export interface Proc { pid: number; cmd: string; ppid?: number; created?: number | null; name?: string; exe?: string }
 const CLAUDE_PROC = /(^|[\\/"\s])claude(\.exe)?("|\s|$)|@anthropic-ai[\\/]claude-code/i;
 const NATIVE_HOST = /native[-_]?host|chrome-native/i;
 
@@ -4042,22 +5131,329 @@ export function listProcs(plat = process.platform, nowMs = Date.now()): Proc[] |
   try {
     if (plat === "win32") {
       const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)|$($_.ParentProcessId)|$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') })|$($_.CommandLine)\" }"],
+        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)|$($_.ParentProcessId)|$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') })|$($_.Name)|$($_.ExecutablePath)|$($_.CommandLine)\" }"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
-      return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
-        .map((m) => { const t = Date.parse(m[3]); return { pid: Number(m[1]), ppid: Number(m[2]), created: Number.isFinite(t) ? t : null, cmd: m[4].trim() }; });
+      return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
+        .map((m) => { const t = Date.parse(m[3]); return { pid: Number(m[1]), ppid: Number(m[2]), created: Number.isFinite(t) ? t : null, name: m[4].trim(), exe: m[5].trim(), cmd: m[6].trim() }; });
     }
     const out = execFileSync("ps", ["-axo", "pid=,ppid=,etimes=,args="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 });
     return out.split(/\r?\n/).map((l) => /^\s*(\d+)\s+(\d+)\s+(\d+)\s?(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
       .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), created: nowMs - Number(m[3]) * 1000, cmd: m[4].trim() }));
   } catch { return null; }
 }
-export const claudeSessions = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pid && CLAUDE_PROC.test(p.cmd) && !NATIVE_HOST.test(p.cmd));
+// Cain 0.19.1: the Claude desktop app's own Electron processes are claude.exe too, and they are not a Claude Code session.
+// Review round 1: the exclusion is positive and narrow (isDesktopShell). A process is left out only when its executable is
+// exactly the desktop app's claude.exe in its install folder (...\WindowsApps\Claude_<package>\app\claude.exe, or
+// ...\AnthropicClaude\app-<version>\claude.exe; a drive path, no \\?\, UNC or 8.3 form, no "." or ".." segment), quoted
+// or not, the same as the executable path Windows lists for it when it lists one, and its command line is the Electron
+// shell: no arguments at all, or a --type= child of a known kind (DESKTOP_TYPES, every --type= on it known), with no
+// Claude Code CLI entry anywhere on it (separators and case folded). Everything else that names claude.exe refuses, and
+// so does any process named claude.exe, node.exe, bun.exe or electron.exe whose command line is empty (it couldn't be
+// read); a process list that can't be read refuses too (chromeBusy). The pinned claude command, any process whose command
+// line names the CLI entry (@anthropic-ai/claude-code, or a claude-code folder's cli.js: node, bun, or the desktop app's
+// own Electron running it as Node) and any other claude.exe is another Claude Code. The extension's native host isn't.
+const CLAUDE_CLI_ENTRY = /@anthropic-ai\\claude-code|\\claude-code\\(?:[^"\\\r\n]*\\)*cli\.(?:[cm]?js|ts)\b/;
+const folded = (x: string) => x.replace(/[\\/]+/g, "\\").toLowerCase();
+export const hasCliEntry = (cmd: string) => CLAUDE_CLI_ENTRY.test(folded(cmd));
+export const DESKTOP_TYPES: readonly string[] = ["gpu-process", "renderer", "utility", "crashpad-handler", "zygote", "broker"];
+export const RUNTIME_NAMES: readonly string[] = ["claude.exe", "node.exe", "bun.exe", "electron.exe"];
+const normExe = (x: string) => x.replace(/\//g, "\\").replace(/\\+/g, "\\").toLowerCase();
+// The executable a command line starts with, and what follows it: a quoted path, or an unquoted one up to the first
+// ".exe" followed by a space or the end (so an unquoted path with spaces is read whole), or else its first word.
+export function splitCmd(cmd: string): { exe: string; rest: string } | null {
+  const m = /^\s*(?:"([^"]+)"|([^"\s][^"]*?\.exe)(?=\s|$)|(\S+))(.*)$/is.exec(cmd);
+  return m ? { exe: m[1] ?? m[2] ?? m[3], rest: m[4] } : null;
+}
+// The words after the executable, quotes kept out of the way of the split.
+const argWords = (rest: string) => [...rest.matchAll(/(?:"[^"]*"|[^\s"])+/g)].map((m) => m[0]);
+export function isDesktopExe(exe: string): boolean {
+  if (!exe || oddForm(exe) || !/^[a-z]:[\\/]/i.test(exe)) return false;
+  const segs = normExe(exe).split("\\");
+  if (segs.slice(1).some((x) => !x || x === "." || x === ".." || /[. ]$/.test(x))) return false;
+  const n = segs.length;
+  if (segs[n - 1] !== "claude.exe") return false;
+  return (n >= 5 && segs[n - 2] === "app" && /^claude_[a-z0-9._-]+$/.test(segs[n - 3]) && segs[n - 4] === "windowsapps")
+    || (n >= 4 && /^app-\d+(\.\d+)*$/.test(segs[n - 2]) && segs[n - 3] === "anthropicclaude");
+}
+// Review round 2: location is not identity. The AnthropicClaude\app-<version> folder is under the owner's own profile, so a
+// copy of the native Claude Code binary (also claude.exe) could sit there. A claude.exe is the desktop shell only when, beside
+// the folder match and the match with the executable path Windows lists (which must be listed, and written on disk case for
+// case: casedOnDisk), the file itself is the Electron shell (desktopIdentity): resources\app.asar beside it, its version
+// info's ProductName and OriginalFilename the desktop app's (DESKTOP_VERSION_INFO), and its Authenticode signature valid with
+// a signer subject naming Anthropic. The file is read through PowerShell (readExeIdentity), once per process image per
+// listing (identityMemo, by path); a reader that fails, or any field that differs, refuses. Off Windows there is no reader:
+// nothing is exempt.
+// Review round 4: issuer, chain_length, root_self_signed and root_trusted describe the signer certificate's chain as Windows builds
+// it (X509Chain over Get-AuthenticodeSignature's SignerCertificate): the issuer of the signer certificate, how many certificates
+// the chain holds, whether its last one is a self-signed root, and whether that root is in the machine's trusted root store.
+export interface ExeIdentity { asar: boolean; product: string; original: string; signer: string; status: string; cased: boolean;
+  issuer: string; chain_length: number; root_self_signed: boolean; root_trusted: boolean }
+export type IdentityReader = (exe: string) => ExeIdentity | null;
+// The Claude desktop app's own claude.exe, as its version info names it (Electron's packager writes the app's product name
+// and its executable's file name). Anything else, the native Claude Code CLI's values included, refuses.
+export const DESKTOP_VERSION_INFO = { product: "Claude", original: "claude.exe" } as const;
+// Review round 4: the signer is a publisher identity, not a substring. The signer certificate's subject distinguished name must
+// equal this exactly, as Get-AuthenticodeSignature's SignerCertificate.Subject prints it. TO BE CONFIRMED against the owner's
+// installed app (setup step 9b records the real value; the Troubleshooting row "chrome_busy ... identity" says how to read it):
+// if the real subject differs, the app is refused (fail closed) until this constant is corrected in a new release.
+export const DESKTOP_SIGNER_SUBJECT = 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US';
+// Whether each segment of an absolute Windows path is written exactly as its directory lists it (the drive letter as the
+// listed executable path gives it). A segment that isn't listed, or a folder that can't be listed, is false.
+export function casedOnDisk(path: string, list: (dir: string) => string[] | null): boolean {
+  if (!/^[A-Za-z]:\\/.test(path) || oddForm(path)) return false;
+  const segs = path.split("\\");
+  if (segs.slice(1).some((x) => !x || x === "." || x === "..")) return false;
+  for (let i = 1; i < segs.length; i++) {
+    const dir = i === 1 ? `${segs[0]}\\` : segs.slice(0, i).join("\\");
+    const names = list(dir);
+    if (!names || !names.includes(segs[i])) return false;
+  }
+  return true;
+}
+const IDENTITY_PS = "$p = $env:PCW_IDENT_EXE; $v = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo; $s = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop; "
+  + "$c = $s.SignerCertificate; $issuer = ''; $len = 0; $rootSelf = $false; $rootOk = $false; "
+  + "if ($c) { $issuer = [string]$c.Issuer; $ch = New-Object System.Security.Cryptography.X509Certificates.X509Chain; "
+  + "$ch.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck; [void]$ch.Build($c); "
+  + "$els = @($ch.ChainElements | ForEach-Object { $_.Certificate }); $len = $els.Count; "
+  + "if ($len -gt 0) { $r = $els[$len - 1]; $rootSelf = ($r.Subject -eq $r.Issuer); "
+  + "$rootOk = [bool](Get-ChildItem -LiteralPath 'Cert:\\LocalMachine\\Root' | Where-Object { $_.Thumbprint -eq $r.Thumbprint }) } }; "
+  + "[pscustomobject]@{ product = [string]$v.ProductName; original = [string]$v.OriginalFilename; signer = [string]$c.Subject; status = [string]$s.Status; "
+  + "issuer = $issuer; chain_length = [int]$len; root_self_signed = [bool]$rootSelf; root_trusted = [bool]$rootOk } | ConvertTo-Json -Compress";
+export function readExeIdentity(exe: string, plat = process.platform): ExeIdentity | null {
+  if (plat !== "win32" || !exe) return null;
+  try {
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", IDENTITY_PS],
+      { encoding: "utf8", env: { ...process.env, PCW_IDENT_EXE: exe }, stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
+    const j = JSON.parse(out.trim());
+    if (!j || typeof j !== "object" || ["product", "original", "signer", "status", "issuer"].some((k) => typeof j[k] !== "string")
+      || typeof j.chain_length !== "number" || typeof j.root_self_signed !== "boolean" || typeof j.root_trusted !== "boolean") return null;
+    const asar = lstatSync(pathWin32.join(pathWin32.dirname(exe), "resources", "app.asar"), { throwIfNoEntry: false })?.isFile() === true;
+    const cased = casedOnDisk(exe, (d) => { try { return readdirSync(d); } catch { return null; } });
+    return { asar, product: j.product, original: j.original, signer: j.signer, status: j.status, cased,
+      issuer: j.issuer, chain_length: j.chain_length, root_self_signed: j.root_self_signed, root_trusted: j.root_trusted };
+  } catch { return null; }
+}
+// One reading per image path for one listing.
+export function identityMemo(reader: IdentityReader): IdentityReader {
+  const seen = new Map<string, ExeIdentity | null>();
+  return (exe) => {
+    const k = normExe(exe);
+    if (!seen.has(k)) { let v: ExeIdentity | null = null; try { v = reader(exe); } catch { v = null; } seen.set(k, v); }
+    return seen.get(k)!;
+  };
+}
+// Review round 4 (follow-up A): which identity check failed, in words the owner can report, with the values read; null when
+// every one holds. The order is fixed: the reading itself, app.asar, the path's case, the version info, the signature's
+// status, the signer's subject (equal to DESKTOP_SIGNER_SUBJECT), then the chain (not self-signed, ending at a self-signed
+// root in the machine's trusted root store).
+const shownValue = (v: unknown) => typeof v === "string" ? `"${v.replace(/[^\x20-\x7e]/g, "?").replace(/"/g, "'").slice(0, 160)}"` : "(none)";
+export function identityFailure(x: ExeIdentity | null): string | null {
+  if (!x) return "identity unreadable (the PowerShell read of its version info and signature failed)";
+  if (x.asar !== true) return "no app.asar beside it";
+  if (x.cased !== true) return "its path isn't written as the disk lists it";
+  if (x.product !== DESKTOP_VERSION_INFO.product || typeof x.original !== "string" || x.original.toLowerCase() !== DESKTOP_VERSION_INFO.original)
+    return `version info mismatch (ProductName ${shownValue(x.product)}, OriginalFilename ${shownValue(x.original)})`;
+  if (x.status !== "Valid") return `signature status ${shownValue(x.status)}`;
+  if (x.signer !== DESKTOP_SIGNER_SUBJECT) return `signer subject ${shownValue(x.signer)}`;
+  if (x.issuer === x.signer || !(x.chain_length >= 2) || x.root_self_signed !== true || x.root_trusted !== true)
+    return `certificate chain (${x.issuer === x.signer ? "self-signed signer" : x.chain_length < 2 ? "no chain" : x.root_trusted !== true ? "root not in the machine's trusted roots" : "chain doesn't end at a root"})`;
+  return null;
+}
+export const desktopIdentity = (x: ExeIdentity | null): boolean => identityFailure(x) === null;
+// A --type child has a complete known shape (review round 2): a known type, given once; every other argument one of Electron's
+// and Chromium's own process switches (ELECTRON_SWITCHES, by name, a value allowed); --app-path, when given, exactly the
+// app.asar beside the executable; and for a utility child exactly one --utility-sub-type, one of the services that run no
+// script (UTILITY_SAFE). node.mojom.NodeService (Electron's utilityProcess, which runs a script), a missing or unknown
+// sub-type, a positional argument (a packaged entry point), any other switch, or any CLI marker refuses.
+export const ELECTRON_SWITCHES: readonly string[] = [
+  "--type", "--user-data-dir", "--app-path", "--lang", "--locale", "--gpu-preferences", "--field-trial-handle", "--mojo-platform-channel-handle",
+  "--variations-seed-version", "--enable-features", "--disable-features", "--force-fieldtrials", "--service-sandbox-type", "--utility-sub-type",
+  "--video-capture-use-gpu-memory-buffer", "--enable-crash-reporter", "--device-scale-factor", "--num-raster-threads",
+  "--enable-main-frame-before-activation", "--renderer-client-id", "--time-ticks-at-unix-epoch", "--launch-time-ticks", "--first-renderer-process",
+  "--standard-schemes", "--secure-schemes", "--bypasscsp-schemes", "--cors-schemes", "--fetch-schemes", "--service-worker-schemes",
+  "--streaming-schemes", "--code-cache-schemes", "--app-user-model-id", "--context-isolation", "--background-color", "--enable-sandbox",
+  "--metrics-client-id", "--crashpad-handler-pid", "--database", "--url", "--annotation", "--initial-client-data", "--monitor-self-annotation",
+  "--no-rate-limit", "--no-upload-gzip", "--shared-files", "--metrics-shmem-handle", "--pseudonymization-salt-handle",
+  "--trace-process-track-uuid", "--message-loop-type-ui", "--disable-gpu-compositing", "--use-angle", "--use-gl", "--gpu-vendor-id",
+  "--gpu-device-id", "--gpu-sub-system-id", "--gpu-revision", "--gpu-driver-version", "--disable-gpu-sandbox", "--no-pre-read-main-dll",
+  "--enable-dinosaur-easter-egg-alt-images", "--disable-databases", "--ignored", "--prefetch", "--subproc-heap-profiling",
+  "--enable-chrome-runtime", "--webview-tag", "--disable-blink-features", "--enable-blink-features", "--disable-electron-site-instance-overrides",
+  "--enable-node-leakage-in-renderers", "--extension-process", "--renderer-process-limit",
+];
+export const UTILITY_SAFE: readonly string[] = [
+  "network.mojom.NetworkService", "storage.mojom.StorageService", "audio.mojom.AudioService", "video_capture.mojom.VideoCaptureService",
+  "data_decoder.mojom.DataDecoderService", "tracing.mojom.TracingService", "proxy_resolver.mojom.ProxyResolverFactory", "chrome.mojom.UtilWin",
+  "device.mojom.XRDeviceService", "media.mojom.CdmServiceBroker", "media.mojom.MediaFoundationServiceBroker", "printing.mojom.PrintCompositor",
+  "shape_detection.mojom.ShapeDetectionService", "screen_ai.mojom.ScreenAIServiceFactory", "on_device_model.mojom.OnDeviceModelService",
+  "patch.mojom.FilePatcher", "unzip.mojom.Unzipper", "quarantine.mojom.Quarantine", "sharing.mojom.Sharing",
+];
+const switchName = (w: string) => w.split("=")[0].toLowerCase();
+const switchValue = (w: string) => { const i = w.indexOf("="); return i < 0 ? null : w.slice(i + 1).replace(/^"|"$/g, ""); };
+export function childShape(words: string[], exe: string): boolean {
+  const types = words.filter((w) => switchName(w) === "--type");
+  if (types.length !== 1) return false;
+  const type = switchValue(types[0]);
+  if (!type || !DESKTOP_TYPES.includes(type)) return false;
+  for (const w of words) {
+    if (!w.startsWith("--") || w.includes('"') && !/^--[a-z0-9-]+="[^"]*"$/i.test(w)) return false;
+    if (!ELECTRON_SWITCHES.includes(switchName(w))) return false;
+  }
+  for (const w of words.filter((x) => switchName(x) === "--app-path"))
+    if (normExe(switchValue(w) ?? "") !== normExe(`${pathWin32.dirname(exe)}\\resources\\app.asar`)) return false;
+  const subs = words.filter((w) => switchName(w) === "--utility-sub-type");
+  if (type === "utility") return subs.length === 1 && UTILITY_SAFE.includes(switchValue(subs[0]) ?? "");
+  return subs.length === 0;
+}
+// Review round 4 (follow-up A): why a process isn't the desktop shell, null when it is. "not_app" for anything that doesn't
+// even name the app's claude.exe (a CLI command line, another path); every other reason is an identity check the owner can
+// report: the executable path not listed, a path mismatch, a listed path outside the app's folder, an unknown child shape, or
+// identityFailure's.
+export function desktopShellWhy(p: Proc, ident: IdentityReader = readExeIdentity): string | null {
+  if (!p.cmd.trim() || hasCliEntry(p.cmd) || NATIVE_HOST.test(p.cmd) || CLI_MARKER.test(p.cmd)) return "not_app";
+  const c = splitCmd(p.cmd);
+  if (!c || !isDesktopExe(c.exe)) return "not_app";
+  // The executable Windows lists for it: present, the same file as the command line names, and itself the app's path.
+  if (!p.exe) return "executable path not listed";
+  if (normExe(p.exe) !== normExe(c.exe)) return "path mismatch (the executable Windows lists isn't the one its command line names)";
+  if (!isDesktopExe(p.exe)) return "the listed executable isn't in the app's folder";
+  const words = argWords(c.rest);
+  if (words.length ? !childShape(words, p.exe) : c.rest.trim() !== "") return "an app process of a shape the worker doesn't know";
+  try { return identityFailure(ident(p.exe)); } catch { return identityFailure(null); }
+}
+export const isDesktopShell = (p: Proc, ident: IdentityReader = readExeIdentity): boolean => desktopShellWhy(p, ident) === null;
+// The identity failures among the processes that stop a run, one line each kind, for the refusal and the launcher's line.
+export function busyWhy(ps: Proc[] | null, pinned?: string, ident: IdentityReader = readExeIdentity): string[] {
+  if (!ps) return [];
+  const once = identityMemo(ident);
+  return [...new Set(claudeSessions(ps, pinned, once).map((p) => desktopShellWhy(p, once)).filter((w): w is string => !!w && w !== "not_app"))];
+}
+// Claude Code's own command-line switches, any of which marks a CLI run whatever the executable.
+const CLI_MARKER = /(?:^|\s)(?:-p|--print|--output-format|--input-format|--resume|--continue|--chrome-native-host|--mcp-config|--permission-mode|--dangerously-skip-permissions|mcp\s+serve)(?:[\s=]|$)/i;
+const procName = (p: Proc): string => {
+  const n = (p.name ?? "").trim() || (p.exe ?? "").trim() || (splitCmd(p.cmd)?.exe ?? "");
+  return (n.split(/[\\/]/).pop() ?? "").toLowerCase();
+};
+export function isClaudeCode(p: Proc, pinned?: string, ident: IdentityReader = readExeIdentity): boolean {
+  if (p.pid === process.pid) return false;
+  const name = procName(p);
+  if (!p.cmd.trim()) return RUNTIME_NAMES.includes(name) || RUNTIME_NAMES.includes(`${name}.exe`);
+  if (NATIVE_HOST.test(p.cmd)) return false;
+  const exe = splitCmd(p.cmd)?.exe ?? null;
+  if (pinned && ((exe && normExe(exe) === normExe(pinned)) || (p.exe && normExe(p.exe) === normExe(pinned)))) return true;
+  if (hasCliEntry(p.cmd)) return true;
+  if (isDesktopShell(p, ident)) return false;
+  return CLAUDE_PROC.test(p.cmd) || name === "claude.exe";
+}
+export const claudeSessions = (ps: Proc[], pinned?: string, ident: IdentityReader = readExeIdentity) => {
+  const once = identityMemo(ident);
+  return ps.filter((p) => isClaudeCode(p, pinned, once));
+};
 export const nativeHosts = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pid && NATIVE_HOST.test(p.cmd) && /claude/i.test(p.cmd));
 
-export function chromeBusy(o: Opts): Code | null {
+// The one plain line a launcher run prints when another Claude Code blocks it (Cain 0.19.1): what to close, by kind,
+// never a path or a process id. A list that can't be read says so.
+export function busyLine(ps: Proc[] | null, pinned?: string, ident: IdentityReader = readExeIdentity): string {
+  if (!ps) return "Stopped: the PC's process list couldn't be read. Close Claude Code wherever it is open, then press a key to try again.";
+  const found = claudeSessions(ps, pinned, ident);
+  // Review round 1: one whose command line couldn't be read could be either.
+  const APP = /[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i;
+  const where = (p: Proc) => `${p.exe ?? ""} ${p.cmd}`;
+  const unread = (p: Proc) => !p.cmd.trim() && !(p.exe ?? "").trim();
+  const inApp = found.some((p) => unread(p) || APP.test(where(p)));
+  const elsewhere = found.some((p) => unread(p) || !APP.test(where(p)));
+  const what = inApp && elsewhere ? "the Code session in the Claude app and every terminal running claude"
+    : inApp ? "the Code session in the Claude app (the app itself can stay open)" : "every terminal running claude";
+  // Review round 4 (follow-up A): a claude.exe in the app's folder that failed an identity check says which, for Cain.
+  const why = busyWhy(ps, pinned, ident);
+  return `Stopped: another Claude Code is running. Close ${what}, then press a key to try again.`
+    + (why.length ? ` The Claude app's own claude.exe failed its identity check (${why.join("; ")}): tell Cain this line.` : "");
+}
+// The launcher (Cain 0.19.1): one file on the owner's desktop, outside the Claude app, that runs bind-profile, the probe
+// or an attended run with a double click, so he never types a command. It prints the worker's own answer, then on a
+// refusal one plain line (--launcher), and waits for a key. Every path it holds is checked: none may carry a character
+// cmd.exe would read as anything but text. Review round 1: printable ASCII only (no character outside it, so no code page
+// can change it), none of " % ! ^ & | < >, each path quoted at every use, delayed expansion off, CRLF line ends.
+export const LAUNCHER_NAME = "Cain PC jobs.cmd";
+const CMD_SAFE = /^[\x20-\x7e]+$/;
+const CMD_SPECIAL = /["%!^&|<>]/;
+// Review round 2: no command is found through PATH or the current folder. cmd's own built-ins (echo, cd, title, setlocal,
+// goto, if, rem, pause) need none; choice is a program, so it is named by its absolute path under the system root, read when
+// the launcher is written (choice: launcherChoice). No %...% expansion, no set /p: the only input is choice's key.
+export const LAUNCHER_BUILTINS: readonly string[] = ["@echo", "echo", "echo.", "rem", "setlocal", "title", "cd", "if", "goto", "pause"];
+export function launcherChoice(env: Record<string, string | undefined>): string {
+  const root = env.SystemRoot ?? env.SYSTEMROOT ?? env.windir ?? "C:\\Windows";
+  return pathWin32.join(root, "System32", "choice.exe");
+}
+export function launcherText(bun: string, worker: string, home: string, choice = "C:\\Windows\\System32\\choice.exe"): string {
+  if (!pathWin32.isAbsolute(choice) || !/^[A-Za-z]:\\/.test(choice) || !/\\choice\.exe$/i.test(choice)) throw new WorkerError("untrusted_config", "the launcher's choice.exe must be an absolute path under the system root");
+  for (const x of [bun, worker, home]) if (typeof x !== "string" || !(/^[A-Za-z]:\\/.test(x) || (process.platform !== "win32" && x.startsWith("/"))))
+    throw new WorkerError("untrusted_config", "a path for the launcher (Bun, worker.ts or the worker folder) isn't absolute");
+  for (const x of [bun, worker, home, choice]) if (typeof x !== "string" || !CMD_SAFE.test(x) || CMD_SPECIAL.test(x) || x !== x.trim())
+    throw new WorkerError("untrusted_config", "a path for the launcher (Bun, worker.ts or the worker folder) holds a character cmd.exe would not read as plain text, or one outside plain ASCII: move it to a folder whose path is plain ASCII letters, digits and spaces");
+  const call = (cmd: string) => `"${bun}" "${worker}" ${cmd} --attended --launcher --home "${home}"`;
+  return [
+    "@echo off",
+    "rem Cain PC jobs: written by worker.ts write-launcher. Double-click it; it runs only what you pick.",
+    "setlocal DisableDelayedExpansion",
+    "title Cain PC jobs",
+    `cd /d "${home}"`,
+    ":menu",
+    "echo.",
+    "echo Cain PC jobs. Keep the Cain jobs Chrome open. Close Claude Code first: any terminal running claude, and the Code session in the Claude app.",
+    "echo   1  Bind the profile (setup step 10)",
+    "echo   2  Run the probe (setup step 11)",
+    "echo   3  Run the queued jobs, while you watch",
+    "echo   Q  Quit",
+    `"${choice}" /c 123Q /n /m "Press 1, 2, 3 or Q: "`,
+    "if errorlevel 4 goto :eof",
+    "if errorlevel 3 goto run",
+    "if errorlevel 2 goto probe",
+    call("bind-profile"),
+    "goto done",
+    ":probe",
+    call("probe"),
+    "goto done",
+    ":run",
+    call("run"),
+    ":done",
+    "echo.",
+    "pause",
+    "goto menu",
+    "",
+  ].join("\r\n");
+}
+export function writeLauncher(o: Opts, desktop?: string): { written: string } {
+  const env = envOf(o);
+  const dir = desktop ?? join(env.USERPROFILE ?? homedir(), "Desktop");
+  if (!existsSync(dir)) throw new WorkerError("untrusted_config", `no desktop folder at ${dir}: pass --desktop <folder>`);
+  const file = join(dir, LAUNCHER_NAME);
+  writeFileSync(file, launcherText(process.execPath, WORKER_FILE, o.home, launcherChoice(env)));
+  return { written: file };
+}
+// What a launcher run prints after the worker's answer: one plain line for a refusal, nothing when it went through.
+export function launcherLine(code: string | null, o: Opts, inst?: Install | null): string | null {
+  if (!code || code === "ok" || code === "idle") return null;
+  if (EDGE_LINES[code]) return EDGE_LINES[code]!;
+  if (code === "chrome_busy") return busyLine((o.procs ?? (() => listProcs(platform(o))))(), inst?.claude, identOf(o));
+  // Review round 1: one plain line, the code alone: no table, no path, no process id.
+  const c = /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "worker_failed";
+  return `Stopped: ${c}. Tell Cain: refusal ${c}.`;
+}
+const identOf = (o: Opts): IdentityReader => o.exeIdentity ?? ((exe) => readExeIdentity(exe, platform(o)));
+export function chromeBusy(o: Opts, inst?: Install): Code | null {
   const ps = (o.procs ?? (() => listProcs(platform(o))))();
-  return !ps || claudeSessions(ps).length ? "chrome_busy" : null;
+  if (!ps) return "chrome_busy";
+  const ident = identityMemo(identOf(o));
+  if (!claudeSessions(ps, inst?.claude, ident).length) return null;
+  // Review round 4 (follow-up A): an identity failure is named in the log, as busyDetail names it in a refusal.
+  const why = busyWhy(ps, inst?.claude, ident);
+  if (why.length) try { appendFileSync(P.log(o), `${clock(o).toISOString()} chrome_busy identity ${why.join("; ")}\n`); } catch { /* never stops the refusal */ }
+  return "chrome_busy";
+}
+// The refusal's detail for chrome_busy: the identity check that failed, when a claude.exe in the app's folder failed one.
+export function busyDetail(o: Opts, inst?: Install): string | undefined {
+  const why = busyWhy((o.procs ?? (() => listProcs(platform(o))))(), inst?.claude, identOf(o));
+  return why.length ? `another Claude Code is running; the Claude app's own claude.exe failed its identity check (${why.join("; ")}): see Troubleshooting, and tell Cain the values` : undefined;
 }
 
 // The bridge check: a short session that calls tabs_context_mcp, opens a page the worker
@@ -4180,7 +5576,7 @@ export function killTree(pid: number, plat = process.platform) {
 // refuse. Chrome and Claude in Chrome's native messaging host are outside the job by design:
 // the worker never starts Chrome (it must already be open), and Chrome starts the host.
 export const JOB_HELPER_SOURCE = join(HERE, "jobrun.cs");
-export const JOB_HELPER_VERSION = "pcw-jobrun 3";
+export const JOB_HELPER_VERSION = "pcw-jobrun 4";
 export const JOB_HELPER_CODES = [121, 122];
 // The system root as Windows reports it (SystemRoot), when it is a plain local folder
 // (X:\...), else C:\Windows. WINDIR and PATH are never used to find the compiler.
@@ -4349,17 +5745,33 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
     const why = watchCalls(calls, log.starts, log.finished, now);
     if (why) { aborted = "hook_margin_low"; abortWhy = callWhy(calls, why, log.starts, now); if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, MARGIN_POLL_MS) : undefined;
-  const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (marginWatch) clearInterval(marginWatch); if (liveChild === child.pid) setLiveChild(null); };
+  // Cain 0.20.0: while the jobs Edge runs on the worker's pipe, a lost pipe or a gone Edge ends the session at once
+  // (edge_pipe_lost), and the claude.exe tree's handles are scanned after the CLI is up and at its result
+  // (pipe_handle_leak, edgeScan).
+  const scan = edgeScan;
+  let scannedEnd = false;
+  const scanNow = (when: "start" | "end") => {
+    if (!scan || aborted || !child.pid) return;
+    const why = scan(child.pid, when);
+    if (why) { aborted = "pipe_handle_leak"; abortWhy = why; killing = escalateAbort(child.pid, killSteps(child)); }
+  };
+  const edgeWatch = scan ? setInterval(() => {
+    if (aborted || !child.pid) return;
+    const lost = edgeLostNow();
+    if (lost) { aborted = "edge_pipe_lost"; abortWhy = lost; killing = escalateAbort(child.pid, killSteps(child)); }
+  }, ABORT_POLL_MS) : undefined;
+  const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (marginWatch) clearInterval(marginWatch); if (edgeWatch) clearInterval(edgeWatch); if (liveChild === child.pid) setLiveChild(null); };
   child.stdout?.on("data", (d) => {
     const t = d.toString();
     if (out.length < 2_000_000) out += t;
+    if (scan && !scannedEnd && /"type"\s*:\s*"result"/.test(t)) { scannedEnd = true; scanNow("end"); }
     if (gated && firstTurnAt !== undefined && !timing) return;
     buf += t;
     for (let i = buf.indexOf("\n"); i >= 0 && (!gated || firstTurnAt === undefined || timing); i = buf.indexOf("\n")) {
       const line = buf.slice(0, i);
       buf = buf.slice(i + 1);
       const at = Date.now();
-      if (firstTurnAt === undefined && /"type"\s*:\s*"assistant"/.test(line)) firstTurnAt = at;
+      if (firstTurnAt === undefined && /"type"\s*:\s*"assistant"/.test(line)) { firstTurnAt = at; scanNow("start"); }
       if (timing && /"tool_use"/.test(line)) noteUses(line, at, performance.now());
       if (gated) continue;
       const init = /"subtype"\s*:\s*"init"/.test(line) ? parseStream(line).init : null;
@@ -5357,6 +6769,7 @@ export async function run(o: Opts): Promise<RunOut> {
     if (n.code === "version_hold_unwritable") detail = clearUnrecorded ? VERSION_HOLD_CLEAR_UNRECORDED_HINT : VERSION_HOLD_UNWRITABLE_HINT;
     if (n.code === "version_hold_cannot_invalidate") detail = VERSION_HOLD_CANNOT_INVALIDATE_HINT;
     if (n.code === "versions_changed") detail = VERSIONS_CHANGED_HINT;
+    if (EDGE_LINES[n.code] && edgeRefusal) detail = edgeRefusal;
     return { code: n.code, job: null, closed: n.closed, ...(detail ? { detail } : {}) };
   }
   const c = n.claim;
@@ -5366,7 +6779,15 @@ export async function run(o: Opts): Promise<RunOut> {
     const limit = Math.min(c.inst.session_minutes * 60_000, MAX_SESSION_MS);
     const leftovers = readLeftovers(o);
     const conf = readConfirmed(o);
+    // Review round 2: the extension gate once more, right before the session starts.
+    const late = gateAgain(o, c.inst);
+    if (late) throw new WorkerError(late, "the extension gate changed between the preflight and the session's start: run check-host");
+    // Cain 0.20.0: the pipe to the jobs Edge and its process, still there.
+    const lostBefore = edgeLostWhy(o);
+    if (lostBefore) throw new WorkerError("edge_pipe_lost", lostBefore);
     const { s, stream, expected, log, canaryUrl, checks } = await session(o, c.inst, h, c.job, limit, leftovers, !!conf?.read_context, pinFor(c.job, c.allow));
+    const lostAfter = edgeLostWhy(o);
+    if (lostAfter) throw new WorkerError("edge_pipe_lost", lostAfter);
     const v = verdict(s, stream, log, tools, h.settings.permissions.deny, canaryUrl, pinFor(c.job, c.allow), leftovers,
       { ...checks, contextAfterRead: !!conf?.read_context, needLive: !o.attended, confirmedExtension: conf?.fingerprint.extension_version ?? null });
     if (v.bad === "tool_inventory") logInventory(o, "run", stream, tools);
@@ -5413,7 +6834,7 @@ export async function run(o: Opts): Promise<RunOut> {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
     // heartbeat says so. No session output is judged or kept.
-    if (!(e instanceof WorkerError) || !SESSION_FAILURES.includes(e.code)) throw e;
+    if (!(e instanceof WorkerError) || !(SESSION_FAILURES.includes(e.code) || e.code === "extra_extension" || e.code === "edge_pipe_lost")) throw e;
     const code = e.code as Code, now = clock(o), mine = stillOurs(o, c, now);
     if (mine && mine !== "cancelled") {
       close(o, mine, result(mine, "failed", code, now, { tools: allowedTools(sessionHashes(o)?.settings) ?? [], attended: !!o.attended }));
@@ -5423,6 +6844,7 @@ export async function run(o: Opts): Promise<RunOut> {
     beat(o, code, c.job.id, now, c.st);
     return { code, job: c.job.id, closed: n.closed };
   } finally {
+    await stopJobsEdge();
     unlock(o);
   }
 }
@@ -6414,6 +7836,10 @@ export async function probe(o: Opts): Promise<Evidence> {
   const tools = h ? allowedTools(h.settings) : null;
   if (!h || !tools) throw new WorkerError("untrusted_config");
   const denied: string[] = h.settings.permissions.deny;
+  // Cain 0.20.0: the probe runs in the jobs Edge only (a Chrome install refuses, browser_not_edge); the pre-launch gate
+  // runs before the lock, and Edge itself starts once the sweep and the sign-in are checked.
+  if (jobsBrowser(inst) !== "edge") throw new WorkerError("browser_not_edge", BROWSER_NOT_EDGE_HINT);
+  edgeGateOrThrow(o, inst);
   const launch = o.launch ?? launchSession;
   const limit = Math.min(inst.session_minutes * 60_000, MAX_SESSION_MS);
   const l = lock(o, now, "probe");
@@ -6422,6 +7848,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     // Leftovers of a worker killed mid-session go first; then the worker's own sign-in.
     if (startSweep(o).code) throw new WorkerError("session_cleanup_failed", cleanupHint(o));
     if (!signedIn(o)) throw new WorkerError("worker_signin_missing", SIGNIN_HINT);
+    await startJobsEdge(o, inst);
     // 1. STOP.
     writeFileSync(P.stop(o), "probe\n");
     let stop_ok = false;
@@ -6497,8 +7924,11 @@ export async function probe(o: Opts): Promise<Evidence> {
     const psBefore = (o.procs ?? (() => listProcs(platform(o))))();
     const before = dedicatedChrome(psBefore, inst);
     const chain_before = chainTimes(psBefore, inst);
-    await (o.ask ?? askOwner)("Restart the Cain jobs Chrome now: close every window of it, open it again on its profile, then press Enter here.");
-    if (!chromeRunning(inst.profile.user_data_dir)) throw new WorkerError("browser_unreachable", "the dedicated Chrome isn't open again on its profile folder");
+    // Cain 0.20.0: the worker restarts the jobs Edge itself (it owns its start, on the pipe): shut down, then started again
+    // through the whole gate and the effective policy read.
+    await stopJobsEdge();
+    await (o.ask ?? askOwner)("The worker has closed the Cain jobs Edge to check the profile keeps its cookie; press Enter here and it starts it again.");
+    await startJobsEdge(o, inst);
     const psAfter = (o.procs ?? (() => listProcs(platform(o))))();
     const after = dedicatedChrome(psAfter, inst);
     const chain_after = chainTimes(psAfter, inst);
@@ -6695,7 +8125,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const short_names = shortNameSetting(resolve(o.home), platform(o));
     const process_end = await (o.processCheck ?? processCheck)(o);
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe process_end ${JSON.stringify(process_end)}\n`); } catch { /* never stops a probe */ }
-    const prefs = extensionPrefs(inst, forcelistOf(o));
+    const prefs = extensionPrefs(inst, forcelistOf(o), inChromePhase(() => chromeVersionRead(o, inst), true)?.version ?? null);
     const ev: Evidence = { v: 1, at: now.toISOString(), target: pin.url, stop_ok, smoke: "connected", signin, config_sweep, credential,
       extensions: prefs.extensions, extension_policy: prefs.policy, popups: popupState(inst), restart, failed_preflight, browser: r.code, canary_ok,
       reading_reports_url: readingReports(stream, ...destStreams), live_extension_version: !!smoke.init?.extension_version && !!stream.init?.extension_version,
@@ -6712,6 +8142,7 @@ export async function probe(o: Opts): Promise<Evidence> {
   } finally {
     // The probe leaves nothing of probe mode behind for a run to find (runPreflight).
     try { cleanProbe(o); } catch { /* the run preflight finds it */ }
+    await stopJobsEdge();
     unlock(o);
   }
 }
@@ -6733,11 +8164,18 @@ export async function bindProfile(o: Opts): Promise<{ bound: string }> {
   const h = sessionHashes(o);
   const tools = h ? allowedTools(h.settings) : null;
   if (!h || !tools) throw new WorkerError("untrusted_config");
-  const reg = manifestViews(o, inst);
-  if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
+  // Cain 0.20.0: bind-profile binds the jobs Edge only, which the worker starts itself after the pre-launch gate and
+  // shuts down when the bind is done.
+  if (jobsBrowser(inst) !== "edge") throw new WorkerError("browser_not_edge", BROWSER_NOT_EDGE_HINT);
   if (startSweep(o).code) throw new WorkerError("session_cleanup_failed", cleanupHint(o));
-  const pre = browserPreflight(o, inst, true) ?? chromeBusy(o);
-  if (pre) throw new WorkerError(pre, pre === "worker_signin_missing" ? SIGNIN_HINT : undefined);
+  await startJobsEdge(o, inst);
+  try {
+    return await bindInEdge(o, inst, h, tools);
+  } finally { await stopJobsEdge(); }
+}
+async function bindInEdge(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof sessionHashes>>, tools: string[]): Promise<{ bound: string }> {
+  const pre = browserPreflight(o, inst, true) ?? chromeBusy(o, inst);
+  if (pre) throw new WorkerError(pre, pre === "worker_signin_missing" ? SIGNIN_HINT : pre === "chrome_busy" ? busyDetail(o, inst) : undefined);
   const now = clock(o);
   const l = lock(o, now);
   if (!l.got) throw new WorkerError("busy");
@@ -6958,16 +8396,23 @@ export interface HostCheck { host: "ok"; extension_entry: { files: string[]; key
 // hive that can't be read), with the fix for each.
 export function checkHost(o: Opts): HostCheck {
   const inst = mustInstall(o);
+  // Cain 0.20.0: on the jobs Edge, check-host is the pre-launch gate itself, every item by name.
+  if (jobsBrowser(inst) === "edge") {
+    edgeGateOrThrow(o, inst);
+    const rec = readEdgeSetup(o)!;
+    return { host: "ok", browser: "edge", edge_setup: { at: rec.at, target: rec.target, target_version: rec.target_version, builtin_ids: rec.builtin_ids }, popups: popupState(inst) } as any;
+  }
   const reg = manifestViews(o, inst);
   if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   if (!hostPath(inst)) throw new WorkerError("untrusted_config", "the registered manifest can't be read, or doesn't list the extension");
-  const prefs = extensionPrefs(inst, forcelistOf(o));
+  // Sixth pass: Chrome's version as read now, in the answer and the refusal, so the acceptance run records which Chrome wrote the files.
+  // Read first, so the answer and the refusal carry it.
+  const chrome = chromeVersionRead(o, inst);
+  const prefs = extensionPrefs(inst, forcelistOf(o), chrome?.version ?? null);
   if (!prefs.files.length)
     throw new WorkerError("extension_entry_missing", `neither Secure Preferences nor Preferences of the dedicated profile has ${prefs.key}: check profile_directory and extension_id in install.json`);
   if (prefs.disagree.length)
     throw new WorkerError("prefs_disagree", { ids: prefs.disagree, extensions: prefs.extensions });
-  // Sixth pass: Chrome's version as read now, in the answer and the refusal, so the acceptance run records which Chrome wrote the files.
-  const chrome = chromeVersionRead(o, inst);
   if (gateRefuses(prefs))
     throw new WorkerError("extra_extension", { other_enabled: prefs.others, by_policy: byPolicy(prefs), refusals: prefs.refusals, extension_policy: prefs.policy,
       extensions: prefs.extensions, chrome_version: chrome, fix: gateFix(prefs, chrome) });
@@ -7322,16 +8767,28 @@ if (isMain && process.argv[2] === "nav-guard") {
   if (preloaded) { startRefusedBeat(o, "preload_flag_set"); say(preloaded); process.exit(1); }
   try {
     const [cmd, a1] = args;
-    if (cmd === "run") run(o).then(say, fail);
-    else if (cmd === "probe") probe(o).then((ev) => { say(ev); const t = probeTail(ev, platform(o)); if (t) say(t); }, fail);
-    else if (cmd === "bind-profile") bindProfile(o).then(say, fail);
+    // Cain 0.19.1: --launcher (the desktop launcher's calls) adds one plain line after a refusal.
+    const launched = args.includes("--launcher");
+    const plain = (code: string | null) => { if (!launched) return; let inst: Install | null = null; try { inst = loadInstall(o); } catch { inst = null; }
+      const l = launcherLine(code, o, inst); if (l) console.log(l); };
+    const failL = (e: unknown) => { plain(e instanceof WorkerError ? e.code : "worker_failed"); fail(e); };
+    if (cmd === "run") run(o).then((r) => { say(r); plain(r.code); }, failL);
+    else if (cmd === "probe") probe(o).then((ev) => { say(ev); const t = probeTail(ev, platform(o)); if (t) say(t); }, failL);
+    else if (cmd === "bind-profile") bindProfile(o).then(say, failL);
+    else if (cmd === "write-launcher") say(writeLauncher(o, flag(args, "--desktop")));
+    else if (cmd === "edge-setup") edgeSetup(o).then((r) => { say({ recorded: r.recorded, edge_daily_use: r.edge_daily_use }); for (const l of r.lines) console.log(l); }, failL);
+    else if (cmd === "edge-record") edgeRecord(o).then(say, failL);
+    else if (cmd === "open-edge") say(openEdge(o));
+    else if (cmd === "record-builtins") recordBuiltins(o).then(say, failL);
     else if (cmd === "confirm-profile") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
       const ev = readJson(P.evidence(o)) as Evidence;
       say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, versions: versionsOf(c.fingerprint, (readJson(P.evidence(o)) as any)?.versions?.chrome_version_source ?? null), hook_worst: readHookWorst(o), boundary_cases: ev.boundary ?? [], ...probeCases(ev),
-        extensions: extensionPrefs(mustInstall(o), forcelistOf(o)).extensions });
+        extensions: (() => { const i = mustInstall(o); return extensionPrefs(i, forcelistOf(o), chromeVersionRead(o, i)?.version ?? null).extensions; })() });
     } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
-    else if (cmd === "dump-extensions") { const inst = mustInstall(o); const d = dumpExtensions(inst, chromeVersionRead(o, inst), forcelistOf(o)); for (const l of dumpHead(d)) console.log(l); say(d); }
+    else if (cmd === "dump-extensions") { const inst = mustInstall(o); const d = dumpExtensions(inst, chromeVersionRead(o, inst), forcelistOf(o)); for (const l of dumpHead(d)) console.log(l);
+      // Cain 0.20.0: on the jobs Edge, the components it lists (record-builtins records them, on the owner's go).
+      if (jobsBrowser(inst) === "edge") { const f = edgeExe(envOf(o)); say({ ...d, edge_components: edgeComponents(inst, "exe" in f ? pathWin32.dirname(f.exe) : null) }); } else say(d); }
     else if (cmd === "open-chrome") say(openChrome(o));
     else if (cmd === "check-cli") say({ cli: checkCli(o) });
     else if (cmd === "clean-probe") say(cleanProbe(o));
@@ -7341,6 +8798,6 @@ if (isMain && process.argv[2] === "nav-guard") {
       const text = signAllowlistFile(a1, flag(args, "--key") ?? "", process.env.PC_OWNER_PASSPHRASE ?? "", flag(args, "--kid") ?? "");
       const out = flag(args, "--out");
       if (out) { writeFileSync(out, text); say({ written: out }); } else process.stdout.write(text);
-    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | dump-extensions | open-chrome | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
+    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | write-launcher [--desktop <folder>] | edge-setup --attended | open-edge --attended | edge-record --attended | record-builtins --attended | confirm-profile --accept-boundary | check-host | dump-extensions | open-chrome | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
   } catch (e) { fail(e); }
 }

@@ -50,6 +50,9 @@ export const CODES = [
   "read_unplaced", "inventory_never_ready", "refusal_cap", "abort_kill_failed", "extension_slow_attach", "hook_margin_low",
   "extension_versions_ambiguous", "versions_changed", "version_hold_unwritable", "nav_log_unset", "chrome_version_timeout",
   "chrome_version_unreadable", "version_hold_cannot_invalidate",
+  // Cain 0.20.0: the Edge jobs browser (worker.ts edgeGate, startJobsEdge, the run's pipe checks).
+  "browser_not_edge", "edge_not_found", "edge_setup_missing", "edge_policy_missing", "edge_host_mismatch", "edge_profiles", "edge_already_open",
+  "devtools_port_file", "edge_policy_not_effective", "edge_pipe_lost", "pipe_handle_leak", "edge_launch_failed",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];

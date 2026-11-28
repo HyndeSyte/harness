@@ -355,8 +355,8 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     redacted), and `dump-extensions` lists all three with what each held (`policy_caches`:
     `absent`, `empty`, `holds` or `unreadable`).
   - **Chrome's own** (`chrome`): an id on Chrome's built-in list (the Web Store, Web Store
-    Payments, the PDF viewer, Hangouts, Network Speech, CryptoToken, Feedback, the Cast media
-    router) **and** at an internal location, component (`location` 5) or external component
+    Payments, the PDF viewer, Hangouts, Network Speech under both its ids, Gemini in Chrome,
+    CryptoToken, Feedback, the Cast media router) **and** at an internal location, component (`location` 5) or external component
     (`location` 10, where Chrome 157 puts Web Store Payments), **and** with its `path` in
     Chrome's install folder (`...\Google\Chrome\Application\<version>\resources\...`,
     outside the user data folder), at `location` 10 as at 5. **Sixth pass:** the fifth pass's
@@ -367,7 +367,19 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     Chrome's own is refused with its exact `path_kind` and its `path`, the user name redacted
     (`Users\<user>\...`), in `refusals` and in the `fix`, and `dump-extensions` prints the same
     `path` for every `location` 10 entry, so the real-PC run can name the one folder to allow
-    later. **Seventh pass:** Chrome's install folder is judged by whole path segments,
+    later. **Cain 0.20.0:** the Chrome 158 component exception (a component at `location` 5 whose
+    `path` is missing) and the component check that tested it are gone with the second design: Chrome
+    is a diagnostic browser only (check-host and dump-extensions), and jobs run in the Cain jobs Edge,
+    whose extensions are held by Edge's own policy and read by the Edge gate (below, "The jobs browser
+    is Edge"). **Accepted gaps, stated
+    plainly:** the `location` 10 rule (a folder on disk under Chrome's install folder) and the per-user
+    install rule are read at check time and could change before Chrome reads them; that time-of-check
+    gap is accepted under the threat model below, because the only possible writer of those folders and
+    of the profile is your own Windows user, who can already edit the profile directly. The extension gate is read once more after Claude in Chrome attaches
+    (the bridge check) and right before the job's session starts; either reading refusing, or
+    differing from the preflight's in any way, refuses as `extra_extension`.
+    `location` 10 still needs the folder on disk, and a profile path or any other folder stays
+    foreign. **Seventh pass:** Chrome's install folder is judged by whole path segments,
     case-insensitively, against `Program Files\Google\Chrome\Application` and
     `Program Files (x86)\Google\Chrome\Application` (as the environment names them), then a
     version folder, then `resources`, then the entry's own folder: a sibling such as
@@ -993,7 +1005,47 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
 - **One Claude Code at a time, and a live bridge.** Before a claim, any other Claude
   Code process on the PC (a session of yours, or one left over) is `chrome_busy`: the
   extension would serve it instead, and the worker's lock can't see it (the extension's
-  own native messaging host doesn't count). Then a short bridge check (at most 90
+  own native messaging host doesn't count). **Cain 0.19.1:** a Claude Code process is the
+  `claude` command `install.json` pins, any other `claude.exe`, or any process whose command
+  line names the Claude Code CLI entry (`@anthropic-ai/claude-code`, or a `claude-code`
+  folder's `cli.js`). The Claude desktop app's own shell is not one, so the app may stay open; a
+  Code session it started still is. **Review round 1:** the shell is recognised positively and
+  narrowly: its executable is exactly the app's `claude.exe` in its install folder
+  (`...\WindowsApps\Claude_<package>\app\claude.exe` or `...\AnthropicClaude\app-<version>\claude.exe`,
+  a drive path, quoted or not, separators and case folded, no `\\?\`, UNC or 8.3 form, and the
+  same as the executable path Windows lists for the process), and its command line is the Electron
+  shell: no arguments at all, or a `--type=` child of a known kind (`gpu-process`, `renderer`,
+  `utility`, `crashpad-handler`, `zygote`, `broker`), with no CLI entry anywhere on it. Anything
+  else that names `claude.exe` refuses, an app-folder `claude.exe` with only CLI flags (`-p`,
+  `--output-format`, `mcp serve`) included; so does any `claude.exe`, `node.exe`, `bun.exe` or
+  `electron.exe` whose command line is empty (it couldn't be read), and a process list that can't
+  be read. **Review round 2:** location is not identity: the `AnthropicClaude\app-<version>` folder
+  is under your own profile, so a copy of the native Claude Code binary (also `claude.exe`) could sit
+  there. A `claude.exe` is the shell only when, besides the folder match and the match with the
+  executable path Windows lists (which must be listed, and written exactly as the folders on disk list
+  it, case for case), the file is the Electron shell: `resources\app.asar` exists beside it, its
+  version info's ProductName and OriginalFilename are the desktop app's (`Claude`, `claude.exe`;
+  the CLI's values, or anything else, refuse), and its Authenticode signature is valid with a signer
+  subject naming Anthropic. **Review round 4:** the signer is a publisher identity, not a name in a
+  string: the signer certificate's subject must equal the pinned `DESKTOP_SIGNER_SUBJECT`
+  (`CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US`, to be confirmed
+  against your installed app in step 9b), the status must be `Valid`, and the certificate's chain, as
+  Windows builds it, must not be self-signed and must end at a root in the machine's trusted root store.
+  A subject that only contains Anthropic refuses. When a `claude.exe` in the app's folder fails, the
+  refusal, the launcher's line and `worker.log` (`chrome_busy identity ...`) say which check failed and
+  the value read: the executable path not listed, a path mismatch, no `app.asar`, the version info (with
+  its ProductName and OriginalFilename), the signature status, the signer subject, or the chain. The
+  shell exemption authenticates the executable's publisher and file identity, not the `app.asar` it
+  loads (see "The threat model" below). The worker reads the version info and the signature through PowerShell
+  (`Get-Item ... .VersionInfo`, `Get-AuthenticodeSignature`), once per process image per listing,
+  cached by path; a reading that fails refuses. A `--type=` child passes only with a complete known
+  shape: one known type, every other argument one of Electron's and Chromium's own process switches
+  (a value allowed; `--app-path` only as the `app.asar` beside it), and for a `utility` child exactly
+  one `--utility-sub-type` from the services that run no script (`network.mojom.NetworkService`,
+  `storage.mojom.StorageService`, `audio.mojom.AudioService`, `video_capture.mojom.VideoCaptureService`,
+  `data_decoder.mojom.DataDecoderService` and the like). `node.mojom.NodeService` (Electron's
+  `utilityProcess`, which runs a script), a missing or unknown sub-type, any other switch, a bare
+  argument (a packaged entry point) or a Claude Code flag refuses. Then a short bridge check (at most 90
   seconds: a tab-context call, a page the worker serves for it, `get_page_text` on it
   and a tab context after) must reach the extension; if it doesn't, the worker ends any
   leftover native messaging host of the extension (no session is running, so none is in
@@ -1070,6 +1122,196 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   **A new Claude in Chrome or `claude` version stops every run, attended ones too**
   (`probe_stale`): only the supervised probe runs until it has passed on the new
   versions and `confirm-profile` has recorded them.
+
+## The jobs browser is Edge (Cain 0.20.0, the second design, stage 1)
+
+**Why.** The gate the Chrome builds had read state: the profile's `Preferences` for the extensions, the
+registry for the native hosts. Reviews held that design: a check that reads state can't stop code the
+browser itself is allowed to load or launch. So enforcement is now **the browser's own policy**, verified
+as effective in the running browser before any job page opens; the reads stay, as verification layers.
+Browser policy on Windows is per user or per machine, never per profile, so on your daily Google Chrome
+it would reach your own browsing. Microsoft Edge reads its own policy key
+(`HKLM\Software\Policies\Microsoft\Edge`), looks native hosts up under its own key first
+(`Software\Microsoft\Edge\NativeMessagingHosts`), installs Chrome Web Store extensions, takes
+`--remote-debugging-pipe`, comes with Windows 11, and Claude Code's docs name it for Claude in Chrome. So
+the jobs browser is Edge, under machine policy that touches nothing of your Chrome, on the condition
+that you don't use Edge yourself (the threat model above).
+
+**Chrome now.** Chrome stays for `check-host` (its old checks, the native host scan included, as
+diagnostics) and `dump-extensions`. `bind-profile`, the probe and every job on an install without
+`"browser": "edge"` refuse by name: `browser_not_edge`.
+
+**The Edge counterparts of every Chrome place.**
+
+| Chrome (diagnostics only now) | The jobs Edge |
+| --- | --- |
+| `...\Google\Chrome\Application\chrome.exe` | `msedge.exe` under `Program Files` (or `Program Files (x86)`) `\Microsoft\Edge\Application` only; a per-user install (`LocalAppData\Microsoft\Edge`) refuses by name (`edge_not_found`, item `edge_per_user_install`) |
+| the jobs user data folder `C:/pc-worker-k7q2xz/chrome` | its sibling `C:/pc-worker-k7q2xz/edge` (a folder directly in the worker folder), with an explicit `--profile-directory` |
+| `Software\Policies\Google\Chrome` | `Software\Policies\Microsoft\Edge` |
+| `Software\Google\Chrome\NativeMessagingHosts` | `Software\Microsoft\Edge\NativeMessagingHosts` (HKLM only) |
+| `Software\Google\Chrome\Extensions` (external extensions) | `Software\Microsoft\Edge\Extensions` (must be empty, both hives, both views) |
+| Chrome's built-in ids (`CHROME_BUILTIN_IDS`) | Edge's own, unknown until captured on your PC: `dump-extensions` on Edge lists them and `record-builtins` records them; until then every component id refuses by name (`component_unknown:<id>`), the fail-closed default |
+
+**How Edge starts.** The worker starts it itself, for bind-profile, the probe and each job, and shuts it
+down after: `msedge.exe --user-data-dir=<the jobs folder> --profile-directory=<the profile> --disable-sync
+--disable-default-apps --no-first-run --remote-debugging-pipe`, nothing else (never
+`--remote-debugging-port` or `--enable-automation`; a test holds the list). The pipe:
+
+- Bun's spawn can pass extra descriptors but has no `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` and inherits
+  every inheritable handle (the launch prototype in the `pcjobs-windows` job shows both), so the launch is
+  the helper's: `pcw-jobrun edge-launch`, a few lines of C# in `jobrun.cs`, compiled on the PC like the
+  Job Object helper (protocol `pcw-jobrun 4`).
+- It creates both pipes non-inheritable, makes only Edge's two ends inheritable inside the single
+  `CreateProcess` call whose handle list names exactly those two, and passes them as CRT file descriptors
+  3 (Edge reads) and 4 (Edge writes) in `STARTUPINFO.lpReserved2`: Edge's runtime turns the descriptors
+  into handles; no raw handle value is read from its command line.
+- It closes its copies of Edge's ends at once, then hands the worker's two ends back by `DuplicateHandle`
+  into the worker's process (by its process id, which must be the helper's parent), not inheritable, and
+  prints Edge's process id and the four handle values.
+- The call is synchronous, so no other spawn of the worker runs during it; the CLI starts after the
+  browser. The helper's `run` (the CLI's Job Object) now starts its program with a handle list of its
+  three standard handles too. Bun's own spawns (git, reg, PowerShell, the helper) inherit only their
+  standard handles; the worker's pipe ends are never inheritable, which the handle scan checks.
+- After the CLI starts and at its result, `pcw-jobrun pipe-scan` compares every handle of every process in
+  the `claude.exe` tree, as an object, with the pipe's four ends; any match fails the run
+  (`pipe_handle_leak`).
+
+**The pre-launch gate** (offline, fail-closed: at check-host, bind-profile, the probe and every job,
+before Edge starts). Each miss refuses by its item's name, all of them listed in the refusal's `fix`:
+
+- the policies of setup's record present under HKLM in both views with their values, nothing else under
+  the Edge policy key (a policy the machine already carries refuses by name, `policy_extra:<name>`;
+  `ExtensionInstallForcelist` and `ExtensionSettings` as `policy_forbidden:<name>`; a cloud management
+  token or a `CloudManagement` key as `cloud_management:<name>`), and nothing under HKCU's Edge policy key
+  (`policy_user:<name>`): code `edge_policy_missing`;
+- the host registered under HKLM only (an HKCU registration of the same name refuses,
+  `host_user_level`), `install.json`'s `native_host_manifest` naming that manifest, the manifest's bytes,
+  the wrapper's bytes, the wrapper's target path and the target's signer and version equal to setup's
+  record (`host_manifest_changed`, `host_wrapper_changed`, `host_target_changed`, `host_signer_changed`,
+  `host_version_changed`), the manifest naming only the wrapper and only the extension's origin, and the
+  host folder admin-only (`host_folder_writable`): code `edge_host_mismatch`;
+- the profile's `Extensions` folder holding only Claude in Chrome's folder; `extensions.settings` in
+  `Preferences` and `Secure Preferences` parsed strictly: only Claude in Chrome (location INTERNAL, its
+  path inside `Extensions\<id>`) and the recorded built-in ids (component locations, paths inside Edge's
+  `Application` folder); `prefs_unpacked:<id>`, `prefs_command_line:<id>`, `prefs_location:<id>:<where>`,
+  `prefs_unknown_id:<id>`, `component_unknown:<id>`, `prefs_path:<id>`, `prefs_parse:<file>` and
+  `prefs_field:<id>:<field>` (a field the gate doesn't know) each refuse; the external extensions key empty
+  (`external_key:<hive><view>`); Edge's `default_apps` and `initial_preferences` seeding nothing
+  (`seed:<which>`): code `extra_extension`;
+- `Local State` listing one profile, the one in `install.json` (`edge_profiles`); no `DevToolsActivePort`
+  file in the jobs folder (`devtools_port_file`); no Edge already running on the jobs folder
+  (`edge_already_open`); the folder written as the disk lists it, with no junction or link on the way
+  (`untrusted_config`).
+
+**The effective policy, before any job page.** Over the pipe: `Browser.getVersion` must say Edge, and the
+process list must show that very process id running the `msedge.exe` the worker started on the jobs
+folder with the pipe switch and none of the forbidden ones (`edge_launch_failed`). The pipe stays open
+until the browser is shut down; a lost pipe or a gone Edge aborts the run (`edge_pipe_lost`); only page
+targets are ever closed (`Target.closeTarget`); nothing of the pipe reaches the CLI. Then the worker opens
+`edge://policy` in a page it owns, reads the policy table as the page's text (`Runtime.evaluate` of
+`document.body.innerText`, never a script of its own on the page; its JSON export when the text is one),
+closes that page, and requires for every policy of item 2: source **Platform**, applies to **Machine**,
+level **Mandatory**, status **OK**, no conflict, and the recorded value. Anything else refuses by name
+(`effective_source:<name>`, `effective_scope:`, `effective_level:`, `effective_status:`,
+`effective_conflict:`, `effective_value:`, `effective_missing:`, `policy_table_unrecognised`), code
+`edge_policy_not_effective`, and no job page opens. **This read is what proves Edge applies these policies
+on an unmanaged machine.** If Edge marks any of them as needing management enrollment, the refusal names
+it (`effective_needs_management:<name>`); the fallback, the same design on your daily Chrome under its
+own key with your explicit acceptance that only the named extension and host run there, is a later piece.
+
+**Ordinary use, each with its own failure reason.**
+
+- An Edge auto-update changes nothing in the gate; the version hold still asks for a fresh probe, as it
+  did for Chrome (`update_pending`, `versions_changed`, `probe_stale`).
+- A Claude Code auto-update changes `claude.exe`'s version: the recorded version differs and the next job
+  refuses (`edge_host_mismatch`, `host_version_changed`; a new signer, `host_signer_changed`) until you
+  run `worker.ts edge-record --attended`, which shows the recorded and the current version and signer and
+  records them only on your yes.
+- A Web Store update of Claude in Chrome between sessions holds runs as before (the version hold) and is
+  shown to you by `edge-record` too (the extension's folder versions), then a new probe confirms it.
+- A policy entry the machine already carries under the Edge key refuses by name (`policy_extra:<name>`):
+  remove it from an elevated prompt (`reg delete "HKLM\Software\Policies\Microsoft\Edge" /v <name> /f`)
+  or tell Cain.
+
+**Setup, in order (each step one line for you; nothing of this has run on the PC yet: the first
+bind-profile and probe after you install are the checks).**
+
+1. **The Edge question.** `bun worker.ts edge-setup --attended --home C:/pc-worker-k7q2xz`: answer `no` if
+   you never use Edge for your own browsing (a `yes` records that jobs don't run in Edge).
+2. **The elevated prompt lines.** edge-setup prints them, each under a `rem` line saying what it does:
+   read them, then run them once from a Command Prompt started with Run as administrator. Then set
+   `"browser": "edge"`, `profile.user_data_dir` to `C:/pc-worker-k7q2xz/edge` and `native_host_manifest`
+   to the manifest's path edge-setup printed (under `C:\ProgramData\CainPcJobs\EdgeHost`) in
+   `install.json`.
+3. **Install Claude in Chrome in the jobs Edge, from the Chrome Web Store.** `worker.ts open-edge
+   --attended --home C:/pc-worker-k7q2xz` opens the jobs Edge on its folder and profile (no pipe, this
+   once); open the extension's Chrome Web Store page, allow extensions from other stores when Edge asks,
+   add Claude in Chrome, then close every window of that Edge.
+4. **Record Edge's built-in ids.** `worker.ts dump-extensions --home C:/pc-worker-k7q2xz` lists them under
+   `edge_components`; then `worker.ts record-builtins --attended --home C:/pc-worker-k7q2xz` records the
+   ones inside Edge's `Application` folder on your yes.
+5. **bind-profile** (launcher 1).
+6. **The probe** (launcher 2).
+7. **confirm-profile**, as before.
+
+**Not verified in this stage.** Nothing ran on the PC. Whether Edge applies these policies on an
+unmanaged machine is proven only by the first run's policy read; the extension's behaviour in Edge only by
+the first probe; the policy page's text shape and the CRT descriptor hand-off only by the first launch.
+
+## The threat model (Cain 0.19.1, review round 4; extended in Cain 0.20.0)
+
+What the PC worker defends against, and what it does not, written down so each accepted gap is a
+choice, not an oversight.
+
+- **In scope:** what a browser session can be steered into by the pages it reads (the allowlist, the
+  hook, the address checks and the typed report above), another Claude Code session or another
+  extension that could drive the Cain jobs Chrome, a native messaging host other than Claude Code's
+  answering Claude in Chrome, and a policy or a setting that changes what Chrome loads.
+- **Out of scope as adversaries: processes running as your own Windows user.** That includes Claude
+  Code sessions and desktop agent sessions you run, and anything else you start. Such a process can
+  already rewrite the worker's own files (`worker.ts`, the harness checkout, Bun), your Chrome profile
+  and the per-user Claude app install, so no check the worker makes could stand against it. The worker
+  folder's ACL keeps other accounts out; it does not keep you out.
+- **Accepted residual: the Claude app's archive.** The desktop shell's exemption (a `claude.exe` in the
+  Claude app's folder not counting as another Claude Code) authenticates the executable's publisher and
+  file identity: its folder, the path Windows lists, `app.asar` beside it, its version info, and a
+  `Valid` Authenticode signature from the pinned publisher whose chain ends at a trusted root. It does
+  not authenticate the `app.asar` archive the executable loads: verifying that needs the app's package
+  verification, which the worker can't run. A replaced `app.asar` in the writable per-user install
+  (`AnthropicClaude\app-<version>`) could run other code under the genuine executable. Anything that
+  can replace it is your own user, out of scope above. On any identity failure the shell is not exempt
+  (fail closed).
+- **Accepted residual: time of check at `location` 10 and the per-user install.** Those rules read
+  the disk when the worker checks and Chrome reads it later; only your own user can write there, and it
+  can already edit the profile. (The component rule and its component check are gone in Cain 0.20.0.)
+- **Accepted residual: cmd.exe's AutoRun.** A double-click on **Cain PC jobs** starts `cmd.exe`
+  without `/d`, so any Command Processor `AutoRun` entry (`HKCU` or `HKLM\Software\Microsoft\Command
+  Processor`) runs before the launcher's first line; re-invoking itself with `cmd /d` can't stop that
+  first run, since it happens before the file is read. An `HKCU` entry is your own user's (out of
+  scope); an `HKLM` one takes an administrator. The launcher calls Bun and `choice.exe` by their full
+  paths and nothing through `PATH`.
+- **In scope (Cain 0.20.0): the Claude Code session the worker drives.** It is the one process that
+  reads untrusted pages, so it is treated as one that could be steered into reaching for the browser
+  by another way than Claude in Chrome. Stage 1 keeps it off the worker's DevTools pipe: the pipe's
+  ends are never inheritable outside the one CreateProcess call that starts Edge, the worker's own ends
+  are duplicated into it not inheritable, Edge has no debugging port (no `--remote-debugging-port`, and
+  a `DevToolsActivePort` file refuses), nothing of the pipe is forwarded to the CLI, and a scan of every
+  handle in the `claude.exe` tree after it starts and at its end fails the run on any handle to the pipe
+  (`pipe_handle_leak`). **Stage 3 enforces the rest** (what the session itself may start or open); until
+  then the existing walls hold it: the pinned settings, the deny rules, the hooks and the Job Object.
+- **Accepted residual: the window between a browser event and the worker's reaction.** The worker
+  learns that the pipe closed or Edge's process ended by polling (about a second), and a page or an
+  extension event acts at once. In that window the session can still issue calls through Claude in
+  Chrome; the hooks still judge each one, and the run then fails (`edge_pipe_lost`).
+- **The condition this design rests on: you don't use Edge for your own browsing.** Browser policy on
+  Windows is per user or per machine, never per profile, so the Edge policies reach every Edge profile
+  on the PC. Setup asks you once, yes or no, and records it (`edge_daily_use` in `edge-setup.json`); a
+  yes stops every job (`edge_setup_missing`). If that changes, say so: the fallback (the same design on
+  your daily Chrome under Chrome's own key, with your explicit acceptance that only the named extension
+  and the named host run there) is a later piece.
+- **Refused by design, not accepted:** a path in another form than the one on disk (an 8.3 short form,
+  a lower-case or other-case spelling, `\\?\` or UNC) is never read as the same path: the worker
+  refuses it rather than normalise it, so an odd form can't stand in for the real one.
 
 ## Set up once, at your PC
 
@@ -1233,7 +1475,23 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    `HKLM` in its 64-bit view and in its 32-bit view (`HKLM\Software\WOW6432Node`), and
    fails with `manifest_path_mismatch` if any registered entry isn't this one, if the
    views hold more than one distinct path, or if no view has one, after normalizing: full
-   path, case, quotes and slashes; `bind-profile` checks it too), the profile
+   path, case, quotes and slashes; `bind-profile` and (Cain 0.19.1) the probe check it too, and all
+   three also refuse a pinned manifest whose host program is in the Claude desktop app's own folder,
+   `WindowsApps\Claude_...` or `AnthropicClaude\`, as `manifest_path_mismatch` naming
+   `desktop_app_host`; **review round 2:** all three also enumerate every subkey of
+   `NativeMessagingHosts` in the same three views, read each manifest it points at, and refuse as
+   `manifest_path_mismatch` when a host of any other name lists
+   `chrome-extension://<your extension id>/` in `allowed_origins` (`other_host:<name>`) or runs a
+   program in the desktop app's folders (`desktop_host:<name>`); **review round 4:** when a view or a
+   manifest can't be read, that refuses every time (`host_scan_failed`, naming the registry key and view
+   that couldn't be read), whether or not the Claude desktop app is running. `bind-profile` keeps what
+   its scan saw (`bound-hosts.json` in the worker folder: each host in each view, its manifest path and
+   the manifest's hash), and every job scans again, at its preflight, after the bridge check and right
+   before its session starts, refusing as `manifest_path_mismatch` on anything the scan refuses by itself
+   and on any difference from that record (`host_changed:<name>`: a host added, gone, moved or whose
+   manifest changed; `host_snapshot_missing`: no readable record, so run `bind-profile` again). A host
+   registered after you bound the profile, for example by a desktop app install or update, stops the
+   next job: before its claim the job stays pending, right before its session the claimed job fails), the profile
    (its folder, profile directory, name **Cain jobs**, and the extension's id from
    chrome://extensions with Developer mode on), and any other Chrome folders to scan
    (`other_user_data_dirs`). Leave
@@ -1277,7 +1535,33 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    or the built file no longer matches what it recorded. If that compiler is missing every
    run stops with `helper_compiler_missing`; if security software stops the build or the
    helper, `helper_blocked`; otherwise `containment_unavailable` (Troubleshooting).
-10. **Bind the profile, once.** First run
+   **9b. The Claude app's file identity, recorded (review round 4).** After the Claude app is
+   installed (or updated), capture the real values of its `claude.exe` on the install kind you have, so
+   the worker's pinned constants (`DESKTOP_VERSION_INFO`, `DESKTOP_SIGNER_SUBJECT`) can be confirmed or
+   corrected. In PowerShell, with `$p` the app's `claude.exe` (MSIX:
+   `(Get-ChildItem "C:\Program Files\WindowsApps\Claude_*\app\claude.exe").FullName`; per-user:
+   `(Get-ChildItem "$env:LOCALAPPDATA\AnthropicClaude\app-*\claude.exe").FullName`, the newest):
+   `(Get-Item -LiteralPath $p).VersionInfo | Select-Object ProductName, OriginalFilename`, then
+   `$s = Get-AuthenticodeSignature -LiteralPath $p; $s.Status; $s.SignerCertificate.Subject; $s.SignerCertificate.Issuer`.
+   Record the install kind (MSIX or per-user), the app version and those five values in the setup
+   record, and send them to Cain. If any differs from the pinned values, the app counts as another
+   Claude Code (`chrome_busy`) until a release corrects the constant: close the app before a run.
+10. **The launcher, then bind the profile, once.** Write the launcher once, from a terminal of
+    your own (not inside the Claude app):
+    `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts write-launcher --home C:/pc-worker-k7q2xz`
+    (add `--desktop <folder>` if your desktop isn't `%USERPROFILE%\Desktop`, for example a
+    OneDrive desktop). It puts **Cain PC jobs** (`Cain PC jobs.cmd`) on your desktop: double-click
+    it and press 1 to bind the profile, 2 for the probe, 3 to run the queued jobs, Q to quit. It
+    prints the worker's answer, and when something stops it, one plain line: for `chrome_busy`,
+    what to close (a terminal running `claude`, or the Code session in the Claude app; the app
+    itself may stay open, plus which identity check the app's own `claude.exe` failed, if it failed
+    one), for each Edge refusal its own plain line (Troubleshooting, the Edge rows), and for any other code `Stopped: <code>. Tell Cain: refusal <code>.`
+    (find the code in Troubleshooting, below), then waits for a key and shows the menu again.
+    Write it again after you move the harness checkout or Bun. The paths it holds (Bun, `worker.ts`
+    and the worker folder) must be plain ASCII with none of `" % ! ^ & | < >`; otherwise
+    `write-launcher` refuses with `untrusted_config` (move that folder; for a desktop folder with an
+    unusual name, pass `--desktop`). Each path is quoted at every use, and the file turns cmd.exe's
+    delayed expansion off. Then run
     `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts check-host --home C:/pc-worker-k7q2xz`
     (Chrome open or closed: it reads only). It passes when nothing but Claude in Chrome and
     Chrome's own is on, no policy installs another extension and every policy hive reads; its
@@ -1287,9 +1571,9 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     included (one in `by_policy` stays on until its policy stops naming it), and run it again. Nothing in the worker turns anything off or removes anything. Then run
     `worker.ts dump-extensions --home C:/pc-worker-k7q2xz` and paste its output into the
     setup record: it holds ids, numbers and folder kinds only.
-    With the Cain jobs Chrome open and no other Claude Code
-    running, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
-    bind-profile --attended --home C:/pc-worker-k7q2xz`. A short session opens a page the worker
+    With the Cain jobs Chrome open and no Claude Code session
+    running, double-click **Cain PC jobs** on your desktop and press 1 (it runs
+    `worker.ts bind-profile --attended --home C:/pc-worker-k7q2xz`). A short session opens a page the worker
     serves on `127.0.0.1`, which sets a random marker as a cookie in this profile only,
     then reads it back from the canary page. The worker keeps only its hash, in
     `C:/pc-worker-k7q2xz/profile-marker.json` (run `icacls C:\pc-worker-k7q2xz\profile-marker.json` to
@@ -1300,14 +1584,17 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     after you cleared browsing data, run `bind-profile` again. It prints `{"bound": ...}`,
     or the code that stopped it.
 11. **The supervised probe: the only way to the first confirmation.** Not a queued job:
-    nothing in the queue runs, and nothing is pushed. **Run it within 5 minutes of a
+    nothing in the queue runs, and nothing is pushed. **Before it, turn Google Docs Offline
+    off** in the Cain jobs Chrome (chrome://extensions in that Chrome, its toggle): it is the
+    one extension there that is yours to switch, Chrome turns it on by default, and the probe
+    and every run refuse while it is on (`extra_extension`). **Run it within 5 minutes of a
     Restart of the PC** (Start, Power, Restart; **not Shut down**, which Windows Fast Startup
     doesn't count as a fresh start, so the uptime isn't reset; or turn Fast Startup off first):
     its first step measures the hook's cold start (`hook_timing`, below) and refuses
     (`cold_sample_missing`, printing the uptime it measured) when the PC has been up longer. With the Cain jobs Chrome open and
-    you watching, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
-    probe --attended --home C:/pc-worker-k7q2xz` (add `--diagnose` for the diagnostic capture,
-    below). In order, it:
+    you watching, double-click **Cain PC jobs** on your desktop and press 2 (it runs
+    `worker.ts probe --attended --home C:/pc-worker-k7q2xz`; for the diagnostic capture, below,
+    run that line with `--diagnose` added in a terminal of your own, outside the Claude app). In order, it:
     - checks the install config, the files' ACLs, the owner key's fingerprint and the
       allowlist's signature, and refuses to start if a `STOP` file is in place;
     - exercises STOP: puts a `STOP` file in place, checks the preflight stops on it, and
@@ -2210,6 +2497,19 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | Code or case | Where to look | What to do |
 | --- | --- | --- |
 | `stopped` | the `STOP` file | Delete `STOP` when you want runs again. |
+| `browser_not_edge` (Cain 0.20.0) | the run's refusal; `install.json` | Jobs run in the Cain jobs Edge since Cain 0.20.0. Do the Edge setup steps (The jobs browser is Edge, above), then set `"browser": "edge"` in `install.json`. Launcher line: "Stopped: jobs run in Edge now." |
+| `edge_not_found` (Cain 0.20.0) | the refusal's `fix`: `edge_missing` or `edge_per_user_install` | Edge must be the machine install under Program Files. A per-user Edge is refused by name. |
+| `edge_setup_missing` (Cain 0.20.0) | `edge-setup.json`; items `edge_setup_missing`, `edge_daily_use`, `edge_setup_extension`, `edge_setup_policies` | Run `edge-setup` (again after this version changes the policy set). `edge_daily_use`: you said you use Edge yourself, so jobs don't run in it; tell Cain if that changes. |
+| `edge_policy_missing` (Cain 0.20.0) | `check-host`'s `fix`, each item by name: `policy_missing:<name>@HKLM64`, `policy_value:`, `policy_extra:`, `policy_forbidden:`, `cloud_management:`, `policy_user:` | Run the elevated lines edge-setup printed again; remove an extra or user policy it names with `reg delete`; a cloud management entry means this Edge is managed: tell Cain. |
+| `edge_host_mismatch` (Cain 0.20.0) | `check-host`'s `fix`: `host_*` items | `host_version_changed` or `host_signer_changed` after a Claude Code update: `edge-record --attended`. `host_user_level`: delete the HKCU registration it names. Any other: run edge-setup's copy and reg lines again. |
+| `extra_extension` with an Edge item (Cain 0.20.0) | `check-host`'s `fix`: `extensions_folder:`, `prefs_*`, `component_unknown:`, `external_key:`, `seed:` | Remove what it names from the jobs Edge (edge://extensions) or the registry; a `component_unknown` id that is Edge's own: `dump-extensions`, then `record-builtins`. A `prefs_field` is a field this version doesn't know: tell Cain the line. |
+| `edge_profiles` (Cain 0.20.0) | `Local State` in the jobs Edge folder | The jobs Edge must hold exactly one profile, the one in `install.json`. |
+| `edge_already_open` (Cain 0.20.0) | Task Manager: `msedge.exe` with the jobs folder | Close every window of the Cain jobs Edge: the worker opens it itself. |
+| `devtools_port_file` (Cain 0.20.0) | `DevToolsActivePort` in the jobs Edge folder | Something opened a debugging port on the jobs Edge. Close it, delete the file, tell Cain. |
+| `edge_policy_not_effective` (Cain 0.20.0) | the refusal's `fix`: `effective_*` items, `policy_table_unrecognised`, `effective_needs_management:` | Edge doesn't apply a policy as set. Open edge://policy in the jobs Edge and compare; `effective_needs_management` means Edge wants an enrolled machine: tell Cain (the Chrome fallback is a later piece). |
+| `edge_pipe_lost` (Cain 0.20.0) | `worker.log` | The pipe to the jobs Edge closed or Edge's process ended during the run: the run failed. Leave the jobs Edge alone while a run goes. |
+| `pipe_handle_leak` (Cain 0.20.0) | `worker.log`: `pipe_scan` lines | A process in the Claude Code session's tree held a handle to the Edge pipe: the run failed. Tell Cain the line. |
+| `edge_launch_failed` (Cain 0.20.0) | the refusal's `fix`: `handshake_*` items; the helper's exit code | The helper couldn't start Edge with the pipe, or the browser on the pipe isn't the Edge it started. Check security software isn't blocking `pcw-jobrun.exe`, then tell Cain. |
 | `session_stopped` | the `STOP` file; `worker.log` | `STOP` appeared while a session ran, and the worker ended it; the job failed and its transcripts were deleted. Delete `STOP` when you want runs again; Cain can queue the job anew. Needs a code change: no. |
 | `worker_signin_missing` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `signed_in`; `C:/pc-worker-k7q2xz/claude-config` | The worker's own Claude Code folder has no sign-in (never set up, deleted, or emptied). Sign it in again (setup step 9: `CLAUDE_CONFIG_DIR` set to it, `claude`, `/login`), then run `check-cli`. From the probe "after two sessions": the sign-in vanished between sessions; sign in again and probe again, and if it repeats, something outside the worker clears that folder (a cleanup tool, a sync client). Needs a code change: no. |
 | `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `transcripts`; `C:/pc-worker-k7q2xz/claude-config` | What a session wrote in `claude-config` couldn't be deleted, after retries. On Windows the message names what holds it where the worker can read it (its image name, process id and the image name of the process that started it, from the Restart Manager through the Job Object helper; `worker.log`'s `session_cleanup_failed held_by` line too). Something holds it open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete everything in `claude-config` but `.credentials.json`, `settings.json` and `CLAUDE.md` by hand, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
@@ -2225,7 +2525,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `popups_allowed` in `worker.log` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `popups`; chrome://settings/content/popups in the Cain jobs profile | Pop-ups and redirects are allowed in the dedicated profile, as its default or for a site. A warning only: runs go on, and the stated boundary covers a popup. Choose **Don't allow sites to send pop-ups or use redirects** and remove any site from the allowed list (setup step 7). Needs a code change: no. |
 | `unattended_unsupported` | `install.json`: `unattended` | This version has no unattended runs; an install file that asks for them is refused by every command that reads it (`run --attended`, `probe`, `bind-profile`, `confirm-profile`, `check-host`, `check-cli`; the key and allowlist tools don't read it). Set `"unattended": false` (and run `worker.ts run --attended` yourself). Needs a code change: no; unattended runs come with a later version that adds request-level blocking. |
 | `busy` | `worker.lock` (its `kind`); a run's refusal detail `holder` | Another run holds the lock. Wait; a lock from a dead run clears itself (`stale_lock` in the heartbeat). When the refusal names `holder` `probe` (twenty-first round), a probe is running: the run checked and swept nothing; wait for the probe to finish, then run again. |
-| `chrome_busy` (the competing-session case) | Task Manager, Details: any `claude.exe`, or `node` running `claude-code` | Close the other Claude Code session (or end a leftover one) and run again. Any other Claude Code process blocks a run, attached to Chrome or not: the worker can't tell, and the extension would serve it instead. |
+| `chrome_busy` (the competing-session case) | The launcher's plain line names what to close; Task Manager, Details: a `claude.exe` outside the Claude app's own folder, or `node`, `bun` or `claude.exe` running `claude-code`'s `cli.js` | Close the other Claude Code session: a terminal running `claude`, or the Code session in the Claude app (end a leftover one in Task Manager), then press a key in **Cain PC jobs** to try again. The Claude app itself may stay open (since Cain 0.19.1 its own shell doesn't count). Any Claude Code session blocks a run, attached to Chrome or not, wherever it runs: the worker can't tell, and the extension would serve it instead. |
 | `extension_unreachable` | `probe`'s detail, or the bridge check in `worker.log` | Open the Cain jobs Chrome on its folder, check Claude in Chrome is on and paired with the `claude` command. The worker already ended a leftover native messaging host and checked again; if it persists, restart that Chrome. |
 | `extension_unreachable` with "Claude in Chrome: not listed" (the strict-MCP-config case) | `probe`'s detail; the `tools` in `probe-evidence.json` hold no `mcp__claude-in-chrome__` names | `--strict-mcp-config` may be keeping the built-in Chrome integration out on your `claude` version. Don't edit the session's flags by hand (the settings hash fails closed): ask for a build without that flag. The inventory check already fails any MCP server but Claude in Chrome's, so dropping the flag keeps that guarantee. Untested assumption: that `--strict-mcp-config` leaves the built-in Chrome integration in. Needs a code change: yes. |
 | `extension_unreachable` with "the claude command printed no session" (Git Bash not found) | run `claude --version` in a terminal of your own; does it complain about git-bash? | `claude` on Windows needs Git Bash, and runs the hook through it. Install Git for Windows, or set `CLAUDE_CODE_GIT_BASH_PATH` to the full path of `bash.exe` (it must exist; any other value is `untrusted_config`), then probe and confirm again (the environment's hash changes). Needs a code change: no. |
@@ -2350,7 +2650,11 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `extension_elsewhere` with an unexpected intermediate | Task Manager, Details, with the Command line column: the extension's native host and its parent | Between the native host and the Cain jobs Chrome sat a process other than the one `cmd.exe` naming your registered host (from `native_host_manifest`), or two of them, or one whose command line Windows won't show (an elevated or another user's process). Check `native_host_manifest` points at the manifest Chrome uses; end the odd process; if your Claude in Chrome starts its host another way, the chain rule needs a code change. |
 | `slow_hook_required` (`confirm-profile`), `slow_hook` not passed (probe) | `probe-evidence.json`: `slow_hook` | With nav-guard stalled, the navigation ran anyway (`opened`) or was refused without a permission denial recorded for it, or it was seen on another `claude` version. Claude Code's `dontAsk` mode isn't refusing what the hook didn't allow on your version, and nothing runs, attended or not, until it does: rerun the probe once; if it repeats, it needs a code change. |
 | `injection` or `injection_plan` not passed (probe) | `probe-evidence.json`: `injection`, `injection_plan` | The planted token got into an accepted fact (a notes field, the account, or the plan's name), or the page was never read. `confirm-profile` refuses until it passes; the schema needs a narrower field. |
-| `manifest_path_mismatch` (`bind-profile`, `check-host`) | `check-host`'s detail (which views differ); `regedit`: `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts`, `HKEY_LOCAL_MACHINE\Software\Google\Chrome\NativeMessagingHosts` and `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts`, the entry named as the manifest's `name`; `install.json`: `native_host_manifest` | A registered manifest Chrome may use for Claude in Chrome's native host (the default value in any of the three views) isn't the file `install.json` names, after normalizing (full path, case, quotes, slashes), the views hold more than one distinct path, or no view has an entry. Set `native_host_manifest` to the registry's path (forward slashes), delete stale entries in the other views, check that file lists your extension in `allowed_origins`, then run `check-host` again. Needs a code change: no. |
+| `manifest_path_mismatch` (`bind-profile`, `check-host`, `probe`) | `check-host`'s detail (which views differ); `regedit`: `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts`, `HKEY_LOCAL_MACHINE\Software\Google\Chrome\NativeMessagingHosts` and `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts`, the entry named as the manifest's `name`; `install.json`: `native_host_manifest` | A registered manifest Chrome may use for Claude in Chrome's native host (the default value in any of the three views) isn't the file `install.json` names, after normalizing (full path, case, quotes, slashes), the views hold more than one distinct path, or no view has an entry. Set `native_host_manifest` to the registry's path (forward slashes), delete stale entries in the other views, check that file lists your extension in `allowed_origins`, then run `check-host` again. Needs a code change: no. |
+| `manifest_path_mismatch` naming `other_host:<name>` or `desktop_host:<name>` (review round 2; check-host on Chrome, a diagnostic since Cain 0.20.0) | `check-host`'s detail; a run's refusal or `worker.log`: `host_scan_refused`; `regedit` at `HKCU`, `HKLM` and `HKLM\Software\WOW6432Node`, each `Software\Google\Chrome\NativeMessagingHosts`; each subkey's `.json` | Another native host, under its own name, lists Claude in Chrome's origin (`chrome-extension://<your extension id>/`) in `allowed_origins`, or runs a program in the Claude desktop app's folder (the app registers one for itself): Chrome could start it for Claude in Chrome. Remove that subkey, or take the origin out of its manifest, then run `check-host` again; the worker only drives Claude Code's host. A desktop app install or update can register one after you bound the profile: the next job then stays pending (or, caught right before its session, fails) with this code. Needs a code change: no. |
+| `manifest_path_mismatch` naming `host_scan_failed` (review round 4; check-host on Chrome since Cain 0.20.0) | the detail names the key, for example `HKLM\Software\Google\Chrome\NativeMessagingHosts (/reg:32, the view itself)` or `HKCU\Software\Google\Chrome\NativeMessagingHosts\<name> (/reg:64), its manifest`; `worker.log`: `host_scan_refused` | The worker couldn't read that registry view, or the manifest file a host's key points at, so it can't tell whether that host answers Claude in Chrome: it refuses whether or not the Claude app runs. Read the key: `reg query "<the key>" /ve <the /reg flag>` (for a view, `reg query "<the key>" <the /reg flag>`), then open the `.json` its default value names. Remove the entry if you don't know it (`reg delete "<the key>" /f <the /reg flag>`, an administrator terminal for `HKLM`), or repair it: point it at a manifest that exists, or fix that file's or key's permissions so your account can read it. Then run `check-host` again; after a change, `bind-profile` again. Needs a code change: no. |
+| `chrome_busy` with the Claude desktop app open and no Code session (review round 2; review round 4: the reason named) | the refusal's detail, the launcher's line or `worker.log` (`chrome_busy identity <reason>`), naming which check failed: `executable path not listed`, `path mismatch`, `the listed executable isn't in the app's folder`, `no app.asar beside it`, `its path isn't written as the disk lists it`, `version info mismatch (ProductName "...", OriginalFilename "...")`, `signature status "..."`, `signer subject "..."`, `certificate chain (...)` or `identity unreadable`; in PowerShell, the commands in step 9b | The app's shell is exempt only by its file identity: `resources\app.asar` beside it, ProductName `Claude` and OriginalFilename `claude.exe`, a `Valid` Authenticode signature whose signer subject equals the pinned `CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US`, and a chain that isn't self-signed and ends at a root in the machine's trusted roots; its children only with known switches and, for a utility child, a sub-type that runs no script (`node.mojom.NodeService` refuses). Read the real values with step 9b's commands (also `$s.SignerCertificate.Issuer`) and send Cain the reason line and those values: if the app is genuine and a value differs, the worker's constant needs a change. Meanwhile close the app before a run. Needs a code change: yes, if the values differ. |
+| `manifest_path_mismatch` naming `desktop_app_host`, or a view whose entry is the Claude desktop app's manifest (Cain 0.19.1) | `check-host`'s detail; the `.json` file `install.json` names (`native_host_manifest`), its `path`; `regedit` as above | The manifest Chrome would use for Claude in Chrome's host name is the Claude desktop app's (registered in `HKCU` by the app, beside Claude Code's in another view), or the pinned manifest's `path` is a program in the app's own folder (`WindowsApps\Claude_...` or `AnthropicClaude\`). The worker only drives Claude Code's host. Point `native_host_manifest` at Claude Code's manifest (the one whose `path` runs `claude --chrome-native-host`), and remove or repoint the other entry so every view names that one file, then run `check-host` again. Needs a code change: no. |
 | `manifest_path_mismatch` naming `HKLM32` (a WOW6432Node entry) | `regedit`: `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts` | An old or 32-bit install left a native host entry in the machine hive's 32-bit view that points elsewhere; Chrome consults that view too. Delete it there (or point it at the same manifest), then run `check-host` again. Needs a code change: no. |
 | `allowlist_risky_url` (`sign-allowlist`) | its detail: `entry <n>: matched "<word>" on host <host>` (the path, query, fragment and sign-in part are never printed, and nothing of the address is written anywhere) | That entry's address has a query, or its path (or a redirect or sign-in path) has a word that acts (`logout`, `signout`, `unsubscribe`, `confirm`, `delete`, `remove`, `cancel`). Open the address yourself in the Cain jobs profile: if it only shows a page, add `"reviewed": true` to the entry and sign again; otherwise pin another address. Needs a code change: no. |
 | `probe_stale` with reason `cli_version_changed` but the same `claude --version` | `confirmed.json`: `cli_sha256` | The `claude` executable's bytes changed (a reinstall, a repair, or a `cli_changed` run) since the deny-alone check was seen on it. Run the probe and `confirm-profile` again. Needs a code change: no. |

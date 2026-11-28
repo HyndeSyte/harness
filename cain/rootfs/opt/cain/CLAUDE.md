@@ -645,6 +645,14 @@ in the harness repo; until then the keeper says it is waiting).
   `hook_selftest_failed`, `containment_unavailable`, `helper_compiler_missing` (Windows has no
   C# compiler for the helper), `helper_blocked` (security software stopped the helper),
   `chrome_busy` (another Claude Code is open on his PC),
+  `browser_not_edge` (jobs run in the Cain jobs Edge since 0.20.0: he does the Edge setup steps),
+  `edge_not_found` (no machine install of Microsoft Edge), `edge_setup_missing` (edge-setup not run,
+  or he said he uses Edge himself), `edge_policy_missing` (an Edge policy missing, wrong or extra:
+  check-host names it), `edge_host_mismatch` (Claude Code's Edge host isn't as recorded; after a
+  Claude Code update he runs edge-record), `edge_profiles` (the jobs Edge has more than one profile),
+  `edge_already_open` (he closes the Cain jobs Edge: the worker opens it itself),
+  `devtools_port_file`, `edge_policy_not_effective` (Edge isn't applying the policies as set),
+  `edge_pipe_lost`, `pipe_handle_leak`, `edge_launch_failed`,
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
   why. Those are fixed at his PC, so they
   go on his "At his PC" list, never in the morning message.
