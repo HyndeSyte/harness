@@ -540,6 +540,32 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
+## What 0.19.4 does: background services start again by themselves
+
+On Nov 27 a Ship tap was refused because the drill store couldn't keep its high-water time (the cause
+was the mix-up 0.19.2 fixes), and its log line didn't say why. Restarting the link by hand then left it
+down: its loop in the App's start script ended at the link's first non-zero exit, and stayed down until
+the App restarted.
+
+- **Every background service starts again after it stops.** The link, the record keeper, the PC job
+  keeper, the review runner, the security watch, the probe, the Discord upkeep and the broker each run
+  in a loop (`/opt/cain/keep-running.sh`) that no exit or signal of its child ends. Each restart after a
+  failure is one line in the App's log with the exit code (and the signal, for 129 and up: 143 is a
+  SIGTERM), for example "Cain's link (link/main.ts) stopped (exit code 143, signal 15): starting it
+  again in 5 seconds". A clean exit isn't logged (some of these are periodic jobs). A service that
+  keeps failing within 30 seconds of its start waits twice as long each time, up to 5 minutes, and back
+  to its usual pause once a run lasts longer. Stopping or restarting the App still stops them all. The
+  sign-in page's loop is kept up the same way: a failed write ends only that pass.
+- **The drill store says why it failed.** Wherever a drill store error used to be swallowed (the
+  high-water time, the refused drill intent, a refusal that couldn't be kept, the spent list, the flag,
+  the aborted record), the one log line it writes now names the error code, the system call and the
+  path, for example "the drill flags' high-water time can't be kept (EACCES, open,
+  /data/link/keeper-drill-spent/.high-water.tmp): nothing is installed". Never a file's contents: a
+  file that doesn't parse is named only as SyntaxError. What is refused, and when, is unchanged.
+- **A stray temp no longer blocks every write.** If something that isn't a regular file (a folder, a
+  link) sits where a drill file's temp goes, it is moved aside whole to `<temp>.stray-<time>` (a link is
+  moved, never its target), never deleted, logged once with where it went, and the write goes on.
+
 ## What 0.19.0 does: working with the Keeper
 
 The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a

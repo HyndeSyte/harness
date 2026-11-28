@@ -340,13 +340,17 @@ if [ "$mode" = old ]; then
   fi
 fi
 
+# The background loops below run their child through keep_running (Cain 0.19.4): under bashio's errexit a
+# child's non-zero exit or a signal used to end its loop for good; now it is logged with its code and the
+# child starts again, backing off when it keeps exiting at once.
+. "$OPT/keep-running.sh"
 # The Discord plugin's upkeep: a loud line if access.json isn't single-owner DM only, and its
 # inbox kept to 7 days and 200 MB.
-( while true; do bun "$OPT/discord/upkeep.ts" 2>&1; sleep 60; done ) &
+( keep_running "Discord upkeep (discord/upkeep.ts)" 60 bun "$OPT/discord/upkeep.ts" 2>&1 ) &
 
 # The broker (the new way only): the one way to the bot, the gate on every send.
 if [ "$mode" = own ]; then
-  ( while true; do bun "$OPT/discord/broker-main.ts" 2>&1; sleep 2; done ) &
+  ( keep_running "broker (discord/broker-main.ts)" 2 bun "$OPT/discord/broker-main.ts" 2>&1 ) &
 fi
 
 # Every tmux call is bounded: a hung tmux can't hold the start, or keep him running past a stop.
@@ -529,7 +533,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   # Keeper 0.1.15: the link's wait for Keeper's acceptance, outside the hook (keeper_accept_min, 1 to 15, default 5)
   KEEPER_ACCEPT_MIN="$(bashio::config 'keeper_accept_min' 2>/dev/null || true)"; [ "$KEEPER_ACCEPT_MIN" = "null" ] && KEEPER_ACCEPT_MIN=""
   export KEEPER_URL KEEPER_TOKEN KEEPER_ACCEPT_MIN
-  while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done
+  keep_running "link (link/main.ts)" 5 bun "$OPT/link/main.ts" 2>&1
 ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
 # App's options and goes only into its environment.
@@ -537,7 +541,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   RECORD_TOKEN="$(bashio::config 'github_token' 2>/dev/null || true)"
   [ "$RECORD_TOKEN" = "null" ] && RECORD_TOKEN=""
   export RECORD_TOKEN
-  while true; do bun "$OPT/record/main.ts" 2>&1; sleep 10; done
+  keep_running "record keeper (record/main.ts)" 10 bun "$OPT/record/main.ts" 2>&1
 ) &
 # The PC job keeper (pcjobs/main.ts): the one writer of jobs to the PC job queue (its own
 # private repo), run on Dane's PC by the worker in a Chrome profile of its own
@@ -549,7 +553,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   PC_JOBS_REPO="$(bashio::config 'pc_jobs_repo' 2>/dev/null || true)"
   [ "$PC_JOBS_REPO" = "null" ] && PC_JOBS_REPO=""
   export PC_JOBS_TOKEN PC_JOBS_REPO
-  while true; do bun "$OPT/pcjobs/main.ts" 2>&1; sleep 10; done
+  keep_running "PC job keeper (pcjobs/main.ts)" 10 bun "$OPT/pcjobs/main.ts" 2>&1
 ) &
 # The review runner (review/main.ts): outside-model reviews. Its keys come from the App's
 # options and go only into its environment, under names no other tool reads. Never printed.
@@ -571,7 +575,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
     REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT
   mkdir -p -m 700 /data/codex
-  while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
+  keep_running "review runner (review/main.ts)" 10 bun "$OPT/review/main.ts" 2>&1
 ) &
 # The security watch (security/main.ts), root's: the outside heartbeat (a ping every 5 minutes to
 # heartbeat_url, when set) and the key record (/data/keys.json: when each key was first seen,
@@ -591,7 +595,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   CAIN_DISCORD_ENV="$TOKEN_FILE"
   HEARTBEAT_URL="$(opt heartbeat_url)"
   export HEARTBEAT_URL CAIN_DISCORD_ENV
-  while true; do bun /opt/cain/security/main.ts run 2>&1; sleep 10; done
+  keep_running "security watch (security/main.ts)" 10 bun /opt/cain/security/main.ts run 2>&1
 ) &
 # The probe (probe/main.ts, Cain 0.14.0), root's, outside his session like watch.sh: every 5 minutes
 # with no model call (the plugin's process, his tmux session, the link's Discord gateway, typed
@@ -606,7 +610,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   v="$(bashio::config 'probe_heartbeat_url' 2>/dev/null || true)"; [ "$v" = "null" ] && v=""
   PROBE_PING_URL="$v"; unset v
   export PROBE_PING_URL
-  while true; do bun "$OPT/probe/main.ts" loop 2>&1; sleep 10; done
+  keep_running "probe (probe/main.ts)" 10 bun "$OPT/probe/main.ts" loop 2>&1
 ) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM. checkin.sh decides when, and
 # only types into an idle session (through as-cain, the new way). Started once, with his session.
@@ -630,7 +634,9 @@ if [ "$mode" != none ] && [ -z "$held" ]; then checkins; fi
 printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain-web/www/signin.html \
   || bashio::log.error "Couldn't write the sign-in page"
 (
-  while true; do
+  # Each pass in a subshell of its own (Cain 0.19.4): under errexit a failed write (a full disk, a
+  # missing page) ended this loop for good; now that pass ends and the next one runs.
+  while true; do (
     screen=$($TMUX_CMD -u capture-pane -p -J -t cain -S -400 2>/dev/null || true)
     url=$(printf '%s\n' "$screen" | "$OPT/signin-url.sh" || true)
     if ! printf '%s\n' "$screen" | tail -n 30 | grep -Eqi 'paste.*code|oauth/authorize'; then
@@ -673,6 +679,7 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
       printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /run/cain-web/www/signin.tmp && mv /run/cain-web/www/signin.tmp /run/cain-web/www/signin.html || true
     fi
     chgrp nogroup /run/cain-web/www/signin.html 2>/dev/null; chmod 0640 /run/cain-web/www/signin.html 2>/dev/null
+    ) || true
     sleep 2
   done
 ) &

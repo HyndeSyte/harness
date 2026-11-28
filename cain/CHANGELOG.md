@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.4
+
+- Cain's background services (the link that carries your taps, the record keeper, the PC job keeper and the others) now start again by themselves after they crash or are stopped, instead of staying down until the App restarts. Each restart is one line in the App's log with its exit code, and one that keeps failing at once waits longer between tries.
+- When a drill file can't be written or read, the log now says why (the error, the system call and the file), never what's in the file. What a drill refuses is unchanged.
+- A stray folder or link left where a drill file's temp goes is moved aside under a `.stray-` name, never deleted, and logged once (saying where it went), instead of failing every install after it.
+
 ## 0.19.3
 
 - No change to what Cain does. This version carries 0.19.1 and 0.19.2 onto the Pi: 0.19.2 was tried once and the keeper refused it because 0.19.1 had never been installed, and the keeper never takes the same update twice, so it needs a new version to install.
