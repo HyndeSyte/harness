@@ -108,7 +108,7 @@ class FakeGmail:
             return "deleted", None
         kind, e = self.look(address, uid)
         if kind != "ok":
-            return "unknown", None
+            return "missing", None                  # a 404: never a deletion (round 5)
         return ("deleted" if e.get("status") == "cancelled" else "ok"), e
 
     def _instance(self, uid):

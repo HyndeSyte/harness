@@ -633,17 +633,23 @@ class GoogleCalendar:
         return ("ok", found) if isinstance(found, dict) else ("unknown", None)
 
     def look_by_id(self, address: str, uid: str) -> tuple[str, dict | None]:
-        """One event by its id, where a deletion matters (the review of Nov 27, round 4): "ok" and it; "deleted"
-        only on 410 Gone or the event answered as cancelled (then with it); "unknown" for anything else. A 404
-        says nothing about a deletion, so it is "unknown", never "deleted"."""
+        """One event by its id, where a deletion matters (the review of Nov 27, rounds 4 and 5): "ok" and it;
+        "deleted" only on 410 Gone or the event answered as cancelled (then with it); "missing" for a 404, which
+        says nothing about a deletion and is never taken as one (callers treat it as unknown; family_copy counts it
+        per copy); "unknown" for anything else. Asked with showDeleted=true, so a deleted event comes back as
+        cancelled where Google keeps it; a 400 to that asks once more without it."""
         url = self._events(address)
         token, _ = self._access()
         if url is None or token is None or not _ANY_ID_RE.fullmatch(uid):
             return "unknown", None
         try:
-            r = self._call(token, "GET", f"{url}/{uid}")
+            r = self._call(token, "GET", f"{url}/{uid}?showDeleted=true")
+            if r.status == 400:
+                r = self._call(token, "GET", f"{url}/{uid}")
             if r.status == 410:
                 return "deleted", None
+            if r.status == 404:
+                return "missing", None
             found = r.json() if r.status == 200 else None
         except (TransportError, ValueError):
             return "unknown", None

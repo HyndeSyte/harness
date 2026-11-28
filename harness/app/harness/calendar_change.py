@@ -1011,6 +1011,7 @@ class Found:
     end: Any = None
     copies: list = field(default_factory=list)   # on Gmail: this add-on's copies of it on Family
     taken: list = field(default_factory=list)    # on Gmail: his own Family events it keeps true
+    kept: list = field(default_factory=list)     # on Gmail: its copies someone changed on Family, left alone (round 5)
     copy_of: str = ""                  # on Family: a copy's key (family_copy.py), if it is one
     block: str = ""                    # on Gmail: a block this add-on made (family_gmail.py): its key
     # On Family, a copy whose Gmail event was looked for by its own identity (the series id and the day's
@@ -5603,7 +5604,7 @@ class CalendarChange:
         if named == "gmail":
             return gmail + [f for f in family if f.copy_of], [f for f in family if not f.copy_of], \
                 unreadable, unread
-        mine = [g for g in gmail if g.copies or g.taken or g.block]
+        mine = [g for g in gmail if g.copies or g.taken or g.kept or g.block]
         return family + mine, [g for g in gmail if g not in mine], unreadable, unread
 
     def _fold(self, found: list[Found]) -> tuple[list[Found], list[Found]]:
@@ -5650,6 +5651,8 @@ class CalendarChange:
             seen_copies.add(row["key"])
             if row["hand"] and row["state"] == "live":
                 source.taken.append(f)         # his own, which its sync keeps true: it follows
+            elif not row["hand"] and row["state"] == "hands_off" and self._copy_diff(f):
+                source.kept.append(f)          # someone changed it on Family: never moved along (round 5)
             else:
                 source.copies.append(f)
         for key, g in sources.items():         # its copy sits on a day not read: read by its record
@@ -5661,7 +5664,8 @@ class CalendarChange:
             copy_ = self._copy_by_record(row)
             if copy_ is not None:
                 copy_.copy_of = key
-                g.copies.append(copy_)
+                (g.kept if not row["hand"] and row["state"] == "hands_off" and self._copy_diff(copy_, row)
+                 else g.copies).append(copy_)
         return gmail, family
 
     def copy_fixes(self, asked: str = "", every: bool = False) -> dict | None:
@@ -5699,6 +5703,18 @@ class CalendarChange:
                     "src_v": self._gmail_version(g), **self._copy_ref(x)})
                 if c is not None:
                     out.append((names, g.first, c))
+            for x in g.kept:                    # changed on Family: offered back only as a take-back (round 5)
+                if g.end is None:
+                    continue
+                diff = self._copy_diff(x)
+                if not diff:
+                    continue
+                end = g.end if isinstance(g.start, datetime) else g.end - timedelta(days=1)
+                c = self._fix_change("move", g.title, g.first, _text(g.start), _text(end), {
+                    "key": x.copy_of, "src": (g.raw or {}).get("id", "") if isinstance(g.raw, dict) else "",
+                    "src_v": self._gmail_version(g), "back": "1", "diff": ",".join(diff)[:300], **self._copy_ref(x)})
+                if c is not None:
+                    out.append((self._copy_names(x.copy_of, g.title, x.title), g.first, c))
         for f in sorted(family, key=lambda f: f.first):
             if not f.copy_of or not any(f.first <= d <= f.last for d in span):
                 continue
@@ -5808,11 +5824,18 @@ class CalendarChange:
         if x is None:
             raise Refuse("I couldn't read that Family copy just now")
         x.copy_of = key
-        if not row["hand"] and not caldav.copy_holds_only_ours(body, row["uid"]):
-            # Something was added to it on Family (an alert, a note, a place, a guest, a link): writing over it or
-            # taking it off would lose that, so it's his to keep (round 4 of the review of Nov 27).
-            raise Refuse(f"the Family copy \u201c{_safe(x.title)}\u201d has something added to it on Family, so "
-                         "it's yours to keep now and I left it as it is")
+        back_card = b.get("back") == "1"
+        if back_card and (row["hand"] or row["state"] != "hands_off"):
+            raise CopyChanged("that Family copy is Harness's own again", key)
+        if not row["hand"] and not back_card:
+            diff = self._copy_diff(x, row)
+            if diff:
+                # The whole copy against what Harness last wrote there (its own record): a changed title or time
+                # counts as much as an alert, a note, a place, a guest or a link added. Writing over it or taking it
+                # off would lose that, so it's his to keep, and left alone (round 5 of the review of Nov 27).
+                family_copy.mark_hands_off(self.ledger, key, "edited", diff)
+                raise Refuse(f"the Family copy \u201c{_safe(x.title)}\u201d has been changed on Family "
+                             f"({_diff_words(diff)}), so it's yours to keep now and I left it as it is")
         if self.google is None or not self._readable("gmail"):
             raise Refuse("I couldn't read your Gmail calendar")
         # Read again right before the write, by its id. Only 410 Gone or cancelled is a deletion (round 4).
@@ -5841,10 +5864,45 @@ class CalendarChange:
             raise CopyChanged("its Gmail event changed since your card", key)
         g = self._gmail_found(e)
         start, end, _ = self._new_times(c)
+        ident = family_copy.source_of(self.ledger, key)
         if g is None or self._copy_key(g) != key or not (_same_start(g.start, start) and g.end is not None
-                                                          and _same_start(g.end, end)):
+                                                          and _same_start(g.end, end)) \
+                or (ident is not None and not family_copy.source_matches(e, *ident)):
             raise CopyChanged("its Gmail event changed since your card", key)
+        if back_card:
+            return self._copy_take_back_part(c["title"], g, x, row, start, end, b)
         return self._copy_catch_up(c["title"], g, [x], start, end)
+
+    def _copy_diff(self, x: Found, row=None) -> list[str]:
+        """What a Harness copy on Family holds beyond or short of what Harness last wrote there (its baseline, from
+        its own record, never from the copy), by line name: empty when it's exactly Harness's own (round 5)."""
+        row = row or self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (x.copy_of,)).fetchone()
+        item = x.raw
+        body = getattr(item, "data", "") or ""
+        if row is None or not body:
+            return ["UNREAD"]
+        if family_copy.pending_state(self.ledger, row["key"])[0] == "damaged":
+            return ["RECORD"]
+        base = family_copy.baseline(self.ledger, row["key"], row)
+        return caldav.copy_differences(body, row["uid"], *base) if base else ["RECORD"]
+
+    def _copy_take_back_part(self, asked: str, g: Found, x: Found, row, start, end, b: dict) -> Part:
+        """Round 5: a copy someone changed on Family, taken back only on his tap: the card says what changed, and
+        the write goes with If-Match on exactly the version the card showed, nothing else."""
+        name = self._name(asked, g)
+        diff = [d for d in (b.get("diff") or "").split(",") if re.fullmatch(r"[A-Z0-9-]{1,40}", d)]
+        what = f" (changed on Family: {_diff_words(diff)})" if diff else ""
+        text = (f"the Family copy of {name}{what}, writing Harness's copy over it at {self._at_words(start, end)}, "
+                "to match your Gmail calendar")
+        step = self._copy_take_back(x, row, start, end, b["fam_v"])
+        targets = frozenset({(x.calendar, x.series, x.instance)})
+        bound = self._bound_of(x, "move")
+        expect = [{"kind": "moved", "calendar": bb["calendar"], "series": bb["series"], "instance": bb["instance"],
+                   "title": bb["title"], "start": _text(start), "end": _text(end), "was": bb["start"]}
+                  for bb in bound]
+        return Part(f"Take back {text}", f"Took back {text}", [step], (targets, ("move", _moment(start),
+                                                                                   _moment(end))),
+                    name=name, bound=bound, expect=expect)
 
     def _copy_found(self, href: str, etag: str, body: str, row) -> "Found | None":
         try:
@@ -5935,7 +5993,7 @@ class CalendarChange:
 
     def _fits(self, asked: str, f: Found) -> int:
         """His words against the event, and against its copies: "Alex - PT" is that PT too."""
-        return max(fit(asked, t) for t in [f.title, *(c.title for c in f.copies + f.taken)])
+        return max(fit(asked, t) for t in [f.title, *(c.title for c in f.copies + f.taken + f.kept)])
 
     def _at(self, f: Found, times) -> bool:
         """At a clock time he gave: 8:00 is the morning's or the evening's, unless he said."""
@@ -7064,7 +7122,63 @@ class CalendarChange:
                        and _same_start(o.start, start) and _same_start(o.end, end) for o in moved)
         return bool(ical.parse_calendar(body)[1])           # "there": a new event
 
-    def _family_write(self, read: "FamilyRead", edit: Callable[[str], str], check: dict, title: str = "") -> dict:
+    def _copy_owned(self, key: str, read: "FamilyRead", op: str, new: str = "", start=None, end=None, *,
+                    take_back: str = "") -> None:
+        """Round 5: a card's write to a copy of Harness's (a move or a removal, with its event or on its own) goes only
+        over a copy that holds exactly what Harness last wrote there, matched whole against its own record (title
+        and times included), and only with If-Match on the version that passed that check (_family_write and
+        _family_delete refuse to send one without). Its pending record, the version and body it goes over and the
+        body it sends, is saved before the write. A take-back goes only over exactly the version its card showed.
+        Anything else: the copy is left alone (hands-off), and nothing is sent."""
+        row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (key,)).fetchone()
+        if row is None or row["hand"] or row["state"] not in COPY_FOLLOWS:
+            return                     # his own copy taken over (its own check), or one Harness no longer keeps
+        base = family_copy.baseline(self.ledger, key, row)
+        if take_back:
+            if not _etag_same(read.etag, take_back) or row["state"] != "hands_off":
+                raise Stopped("changed", words="that Family copy changed since your card, so nothing was sent")
+        elif row["state"] == "live":   # a copy left alone is his, on his card like any Family event
+            damaged = family_copy.pending_state(self.ledger, key)[0] == "damaged"
+            diff = ["RECORD"] if damaged or base is None else caldav.copy_differences(read.body, row["uid"], *base)
+            if diff:
+                family_copy.mark_hands_off(self.ledger, key, "record" if damaged else "edited", diff)
+                raise ics_edit.Cant(f"the Family copy has been changed on Family ({_diff_words(diff)}), so it's yours "
+                                    "to keep now and I left it as it is")
+        if not read.etag or _weak(read.etag) or self._unprotected("family"):
+            raise Stopped("failed", words="a Family copy is written only with If-Match on its version, and none could "
+                                          "be sent, so nothing was sent")
+        wrote = (row["title"], start, end) if op == "put" and start is not None else None
+        family_copy.note_write(self.ledger, key, read.etag, landed=False, wrote=wrote, before=base,
+                               prior_body=read.body, intended=new, op=op)
+
+    def _copy_after_refusal(self, key: str, href: str) -> None:
+        """Round 5: a copy's write refused for its version (412) or with its answer lost: the copy read again and
+        the allowlist run again, never retried blindly. Exactly what Harness last wrote, or exactly what this write
+        sent, stays Harness's; anything else is someone's, left alone."""
+        row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (key,)).fetchone()
+        if row is None or row["hand"]:
+            return
+        try:
+            back, body = self.client.fetch(href)
+        except Exception as e:                           # a look is a help, never a stop
+            log.warning("a copy couldn't be read again after its write: %s", type(e).__name__)
+            return
+        if back.kind != "ok" or not body:
+            return
+        state, pending = family_copy.pending_state(self.ledger, key)
+        base = family_copy.baseline(self.ledger, key, row)
+        wrote = family_copy.pending_fields(pending, "wrote") if state == "ok" else None
+        if state == "damaged":
+            family_copy.mark_hands_off(self.ledger, key, "record", ["RECORD"])
+            return
+        if (base and family_copy.content_is(body, row["uid"], *base)) or (
+                wrote and family_copy.content_is(body, row["uid"], *wrote)):
+            return
+        family_copy.mark_hands_off(self.ledger, key, "changed", caldav.copy_differences(
+            body, row["uid"], *(base or (row["title"], _when(row["start"]), _when(row["end"])))))
+
+    def _family_write(self, read: "FamilyRead", edit: Callable[[str], str], check: dict, title: str = "",
+                      copy_key: str = "") -> dict:
         """The write, then what the calendar holds afterward, not what was sent. An answer that's
         lost, or a read back that fails or doesn't show it, leaves it to a read (_settle). Sent over
         the card's version when it kept one: a refusal for the version is read by id (_fenced).
@@ -7078,9 +7192,14 @@ class CalendarChange:
         entry = {"cal": "family", "how": "put", "href": href, "before": before, "after": new,
                  "sent": new, "etag": "", "was": etag, "check": check}
         guard = self._guard_for(read)            # stale since the card: nothing is sent (eighth round)
+        if copy_key and guard != read.etag:
+            raise Stopped("failed", words="a Family copy is written only with If-Match on its version, so nothing "
+                                          "was sent")
         self._attempt(entry)
         out = self._bounded("family", self.client.replace, href, guard, new)
         self._sent("family", check.get("kind") or "change", guard, out)
+        if copy_key and out.kind in ("changed", "unknown"):
+            self._copy_after_refusal(copy_key, href)
         if out.kind == "changed" and title:
             self._fenced("family", "", {"kind": check.get("kind"), "check": check}, title, href, guard)
         if out.kind != "ok":
@@ -7120,13 +7239,18 @@ class CalendarChange:
                     [("family", first.series, k, first.title, d) for k, d in zip(keys, days)], what="Family",
                     spec={"fn": "family_remove_days", "found": [_found_json(f) for f in group]})
 
-    def _family_delete(self, read: "FamilyRead", title: str = "") -> dict:
+    def _family_delete(self, read: "FamilyRead", title: str = "", copy_key: str = "") -> dict:
         href, body, etag = read.href, read.body, read.etag
         entry = {"cal": "family", "how": "restore", "href": href, "before": body, "was": etag}
         guard = self._guard_for(read)            # stale since the card: nothing is sent (eighth round)
+        if copy_key and guard != read.etag:
+            raise Stopped("failed", words="a Family copy is taken off only with If-Match on its version, so nothing "
+                                          "was sent")
         self._attempt(entry)
         out = self._bounded("family", self.client.remove_at, href, guard)
         self._sent("family", "removal", guard, out)
+        if copy_key and out.kind in ("changed", "unknown"):
+            self._copy_after_refusal(copy_key, href)
         if out.kind == "changed" and title:
             self._fenced("family", "", {"kind": "gone"}, title, href, guard)
         if out.kind != "ok":
@@ -7141,7 +7265,9 @@ class CalendarChange:
             read = self._family_fetch(f.raw.href)
             if ics_edit.people(read.body):
                 raise ics_edit.Cant("it has invitees, and changing it could message them")
-            return self._family_delete(read, f.title)
+            if f.copy_of:
+                self._copy_owned(f.copy_of, read, "delete")
+            return self._family_delete(read, f.title, f.copy_of)
         return Step(f"Family: {_safe(f.title)} on {_day_words(f.first)} removed.", run,
                     [("family", f.series, "", f.title, f.first)], what="Family",
                     spec={"fn": "family_remove_one", "found": [_found_json(f)]})
@@ -7168,9 +7294,15 @@ class CalendarChange:
         def run() -> dict:
             read = self._family_fetch(href)
             now = self.ledger.now()
-            return self._family_write(read, lambda body: ics_edit.move_day(body, f.instance, start, end, self.tz, now)
-                                      if f.instance else ics_edit.move_one(body, start, end, self.tz, now),
-                                      check, f.title)
+
+            def edit(body: str) -> str:
+                return (ics_edit.move_day(body, f.instance, start, end, self.tz, now) if f.instance
+                        else ics_edit.move_one(body, start, end, self.tz, now))
+            if f.copy_of:
+                new = edit(read.body)
+                self._copy_owned(f.copy_of, read, "put", new, start, end)
+                return self._family_write(read, lambda body: new, check, f.title, f.copy_of)
+            return self._family_write(read, edit, check, f.title)
         return Step(f"Family: {_safe(f.title)} on {_day_words(f.first)} moved to {self._when_words(start, end)}.",
                     run, what="Family",
                     spec={"fn": "family_move", "found": [_found_json(f)], "start": _text(start), "end": _text(end)})
@@ -7184,11 +7316,35 @@ class CalendarChange:
         row = self.ledger.db.execute("SELECT start, end, state FROM family_copies WHERE key=? AND state IN "
                                      f"({','.join('?' * len(COPY_FOLLOWS))})", (f.copy_of, *COPY_FOLLOWS)).fetchone()
         if row is not None:
-            # One left alone after an edit is kept true again from here on (Nov 27): brought to its event.
+            # Only a copy still Harness's own moves along (round 5: one someone changed comes back only by a
+            # take-back card, on his tap).
             step.rows = [{"table": "family_copies", "key": f.copy_of,
                           "set": {"start": _text(start), "end": _text(end), "missing": 0, "state": "live"},
                           "was": {"start": row["start"], "end": row["end"], "state": row["state"]},
                           "hold": [row["start"], row["end"]]}]
+        return step
+
+    def _copy_take_back(self, f: Found, row, start, end, version: str) -> Step:
+        """Round 5: Harness's copy written whole over a copy someone changed, on his tap only, with If-Match on the
+        version his card showed (_copy_owned); its record back to live and its baseline what this wrote."""
+        href = f.raw.href
+        check = {"kind": "starts", "start": _text(start), "end": _text(end), "instance": f.instance,
+                 "uid": f.series}
+        key, uid, title = f.copy_of, row["uid"], row["title"]
+
+        def run() -> dict:
+            read = self._family_fetch(href)
+            new = caldav.build_copy_ics(uid, title, start, end, self.ledger.now())
+            self._copy_owned(key, read, "put", new, start, end, take_back=version)
+            return self._family_write(read, lambda body: new, check, f.title, key)
+        step = Step(f"Family: the copy {_safe(f.title)} taken back at {self._when_words(start, end)}.", run,
+                    what="the Family copy",
+                    spec={"fn": "copy_take_back", "found": [_found_json(f)], "start": _text(start), "end": _text(end),
+                          "version": version})
+        step.rows = [{"table": "family_copies", "key": key,
+                      "set": {"start": _text(start), "end": _text(end), "missing": 0, "state": "live"},
+                      "was": {"start": row["start"], "end": row["end"], "state": "hands_off"},
+                      "hold": [row["start"], row["end"]]}]
         return step
 
     def _copy_remove(self, f: Found) -> Step:
@@ -7875,6 +8031,11 @@ class CalendarChange:
             step = self._family_move(found[0], _when(spec["start"]), _when(spec["end"]))
         elif fn == "family_add":
             step = self._family_add(spec["c"], spec["key"])
+        elif fn == "copy_take_back":
+            row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (found[0].copy_of,)).fetchone()
+            if row is None:
+                raise ValueError("no copy to take back")
+            step = self._copy_take_back(found[0], row, _when(spec["start"]), _when(spec["end"]), spec["version"])
         elif fn == "gmail_remove":
             step = self._gmail_remove(found[0])
         elif fn == "gmail_end":
@@ -8898,6 +9059,24 @@ def _plan(row) -> dict:
 def _on_day(f: Found, day: date) -> bool:
     """On that day, or its Family copy is: a copy left behind on its old day is still that event (Nov 27)."""
     return f.first <= day <= f.last or any(x.first <= day <= x.last for x in f.copies)
+
+
+_DIFF_WORDS = {"SUMMARY": "its title", "DTSTART": "its start", "DTEND": "its end", "VALARM": "an alert",
+               "LOCATION": "a place", "X-APPLE-STRUCTURED-LOCATION": "a place", "DESCRIPTION": "notes",
+               "X-APPLE-TRAVEL-DURATION": "travel time", "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR": "travel time",
+               "X-APPLE-TRAVEL-START": "travel time", "ATTENDEE": "a guest", "URL": "a link", "STATUS": "its status",
+               "RRULE": "a repeat", "EVENTS": "another event", "TRANSP": "its free or busy"}
+
+
+def _diff_words(diff: list[str]) -> str:
+    """What changed on a copy, in plain words, by line name only (never what the lines say)."""
+    out: list[str] = []
+    order = list(_DIFF_WORDS)
+    for d in sorted(diff, key=lambda d: order.index(d) if d in order else len(order)):
+        w = _DIFF_WORDS.get(d, "something else" if d not in ("RECORD", "UNREAD") else "my record of it")
+        if w not in out:
+            out.append(w)
+    return _and(out) if out else "something"
 
 
 def _found_json(f: Found) -> dict:

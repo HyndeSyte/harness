@@ -1601,7 +1601,9 @@ def test_a_lost_answer_does_not_double_on_the_next_try(copy):
     event = occ(uid="u1", start=when(copy, 5))
     copy.icloud.drop_response_next = True
     read(copy, event)
-    assert len(copy.icloud.family()) == 1 and "try again" in copy.ledger.get_meta(PROBLEM)
+    # Round 5: a lost answer is read back at once; the copy there, exactly as written, is Harness's own.
+    assert len(copy.icloud.family()) == 1 and copy.ledger.get_meta(PROBLEM) == ""
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()["state"] == "live"
     read(copy, event)
     assert len(copy.icloud.family()) == 1
     assert copy.ledger.get_meta(PROBLEM) == ""
@@ -1610,9 +1612,14 @@ def test_a_lost_answer_does_not_double_on_the_next_try(copy):
 def test_a_uid_that_isnt_ours_is_not_taken(copy):
     from harness.family_copy import _key, _uid
     event = occ(uid="u1", start=when(copy, 5))
-    copy.icloud.seed(f"{FAMILY_PATH}{_uid(_key(event))}.ics", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+    path = f"{FAMILY_PATH}{_uid(_key(event))}.ics"
+    copy.icloud.seed(path, "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+    there = copy.icloud.events[path]
     read(copy, event)
-    assert "try again" in copy.ledger.get_meta(PROBLEM)
+    read(copy, event)
+    # Round 5: If-None-Match refused, and what's there isn't Harness's copy as written: left alone, never written over.
+    assert copy.icloud.events[path] == there
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()["state"] == "hands_off"
 
 
 def test_a_refused_write_is_said_and_tried_again(copy):

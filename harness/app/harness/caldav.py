@@ -136,7 +136,8 @@ def build_copy_ics(uid: str, title: str, start, end, now: datetime) -> str:
              "BEGIN:VEVENT", f"UID:{uid}",
              f"DTSTAMP:{now.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
              when("DTSTART", start), when("DTEND", end), f"SUMMARY:{_esc(title)}",
-             f"{MARKER}:1", "END:VEVENT", "END:VCALENDAR"]
+             # Written, not left to iCloud's default (round 5): a fresh copy reads as written whatever iCloud adds.
+             "TRANSP:OPAQUE", f"{MARKER}:1", "END:VEVENT", "END:VCALENDAR"]
     return "\r\n".join(_fold(x) for x in lines) + "\r\n"
 
 
@@ -290,34 +291,141 @@ def _as_sent(read: str, sent: str) -> bool:
     return True
 
 
-def copy_as_written(ics: str, uid: str, title: str, start, end) -> bool:
-    """A Family copy (family_copy.py) holds exactly what Harness writes for it and nothing more: one plain event,
-    its uid, Harness's marker kept, and by what they say (times as instants, text unfolded and unescaped, the lines
-    servers manage and an alarm a server marks as its default aside, _as_sent) only the lines build_copy_ics
-    writes, with this title, start and end. An allowlist: an alarm, an attendee, a link, a status, a repeat, a
-    second event, a place or notes someone added, or any line build_copy_ics doesn't write, is someone's edit
-    (the review of Nov 27, round 4)."""
-    if not ics or not uid or not _is_ours(ics, uid):
-        return False
+# Round 5 of the review of Nov 27: a Family copy is judged by a strict allowlist, with no blanket X- exemption.
+# Set aside, by name, only Harness's own marker (compared like any line it writes) and the iCloud bookkeeping lines
+# the repo's iCloud shapes model as the server's own; X-APPLE-TRAVEL-*, X-APPLE-STRUCTURED-LOCATION and every other
+# X- line count as edits. Stamps are a server's (_STAMPS).
+COPY_SERVER_LINES = frozenset({"X-APPLE-CREATOR-IDENTITY", "X-APPLE-CREATOR-TEAM-IDENTITY"})
+# Inside an alarm: its own id lines and the default mark are bookkeeping; what it does is its payload.
+_ALARM_BOOKKEEPING = frozenset({"X-WR-ALARMUID", "UID", "X-APPLE-DEFAULT-ALARM", "ACKNOWLEDGED"})
+# An alarm marked X-APPLE-DEFAULT-ALARM:TRUE is iCloud's own only when its whole payload is one of these (trigger,
+# action, and a display alarm's fixed text), as the repo models iCloud writing them: "none", and the default
+# 15-minute alert. Any other alarm, marked or not, is someone's edit.
+ICLOUD_DEFAULT_ALARMS = (("ACTION:NONE", "TRIGGER;VALUE=DATE-TIME:19760401T005545Z"),
+                         ("ACTION:DISPLAY", "DESCRIPTION:Reminder", "TRIGGER:-PT15M"))
+# Outside the event, only a time zone block may stand beside it (iCloud may write the copy's times in its zone).
+_COPY_BESIDE = frozenset({"VTIMEZONE", "STANDARD", "DAYLIGHT"})
+
+
+def _default_alarm(payload: list[str]) -> bool:
+    said = tuple(sorted(_meant(x) for x in payload))
+    return any(said == tuple(sorted(_meant(x) for x in shape)) for shape in ICLOUD_DEFAULT_ALARMS)
+
+
+def _copy_said(ics: str) -> tuple[list[tuple[str, Counter]], list[str]]:
+    """Each event in a Family copy, by its uid, with what it says strictly (round 5): every line by what it says
+    (_meant), the stamps and COPY_SERVER_LINES aside, TRANSP:OPAQUE as the default it is (RFC 5545: a missing TRANSP
+    means OPAQUE), each alarm as one whole unless it is one of iCloud's default alarms; and the names of anything
+    beside the events that isn't a time zone block (a to-do, a journal), which is an edit too."""
+    lines, names = _lines(ics)
+    events: list[tuple[str, Counter]] = []
+    odd: list[str] = []
+    stack: list[str] = []
+    said: Counter | None = None
+    uid = ""
+    alarm: list[str] | None = None
+    marked = False
+    for line, name in zip(lines, names):
+        if name in ("BEGIN", "END"):
+            comp = line.split(":", 1)[-1].strip().upper()
+            if name == "BEGIN":
+                stack.append(comp)
+                if comp == "VEVENT" and stack == ["VCALENDAR", "VEVENT"]:
+                    said, uid = Counter(), ""
+                elif comp == "VALARM" and said is not None and stack[-2:] == ["VEVENT", "VALARM"]:
+                    alarm, marked = [], False
+                elif said is not None:
+                    said[f"BEGIN:{comp}"] += 1          # anything else inside the event
+                elif comp not in ("VCALENDAR", "VEVENT") and comp not in _COPY_BESIDE:
+                    odd.append(comp)
+                continue
+            if stack:
+                stack.pop()
+            if comp == "VALARM" and alarm is not None:
+                if not (marked and _default_alarm(alarm)):
+                    said["VALARM:" + "|".join(sorted(_meant(x) for x in alarm))] += 1
+                alarm = None
+            elif comp == "VEVENT" and said is not None and stack == ["VCALENDAR"]:
+                events.append((uid, said))
+                said = None
+            continue
+        if said is None:
+            continue                                    # the calendar's own lines, or a time zone block
+        if alarm is not None:
+            if name == "X-APPLE-DEFAULT-ALARM":
+                marked = marked or line.split(":", 1)[-1].strip().upper() == "TRUE"
+            elif name not in _ALARM_BOOKKEEPING:
+                alarm.append(line)
+            continue
+        if name in _STAMPS or name in COPY_SERVER_LINES:
+            continue
+        if name == "UID" and ":" in line:
+            uid = line.split(":", 1)[1].strip()
+        meant = _meant(line)
+        if meant != "TRANSP:OPAQUE":
+            said[meant] += 1
+    if said is not None or stack:
+        odd.append("UNFINISHED")
+    return events, odd
+
+
+def _name_of(said_line: str) -> str:
+    return re.split(r"[;:]", said_line, maxsplit=1)[0].upper()
+
+
+def copy_differences(ics: str, uid: str, title: str, start, end) -> list[str]:
+    """What a Family copy holds beyond, or short of, exactly what Harness writes for this title, start and end, by
+    line name ("SUMMARY", "DTSTART", "VALARM", "X-APPLE-TRAVEL-DURATION", "EVENTS" for a second event, "MARKER" for
+    its marker gone...). Empty means it holds exactly that: Harness's own (round 5's strict allowlist)."""
+    if not ics:
+        return ["EMPTY"]
     try:
         sent = build_copy_ics(uid, title or "", start, end, datetime(2000, 1, 1, tzinfo=timezone.utc))
     except (TypeError, ValueError, AttributeError):
+        return ["UNREADABLE"]
+    try:
+        have, odd = _copy_said(ics)
+    except (ValueError, TypeError, AttributeError):
+        return ["UNREADABLE"]
+    (_, want), = _copy_said(sent)[0]
+    out = set(odd)
+    if len(have) != 1:
+        out.add("EVENTS")
+    mine = [said for got, said in have if got == uid]
+    if not mine:
+        return sorted(out | {"UID"})
+    said = mine[0]
+    if not _is_ours(ics, uid):
+        out.add("MARKER" if f"{MARKER}:1" not in _lines(ics)[0] else "NOT-PLAIN")
+    out |= {_name_of(x) for x in (said - want) + (want - said)}
+    return sorted(out)
+
+
+def copy_as_written(ics: str, uid: str, title: str, start, end) -> bool:
+    """A Family copy (family_copy.py) holds exactly what Harness writes for it and nothing more (round 5): one plain
+    event, its uid, Harness's marker kept, and only the lines build_copy_ics writes, with this title, start and end,
+    by what they say (times as instants, text unfolded and unescaped). Aside: stamps, the named iCloud bookkeeping
+    lines (COPY_SERVER_LINES), a time zone block, and only iCloud's own default alarms (ICLOUD_DEFAULT_ALARMS). An
+    allowlist: anything else, travel time, a structured place, any other X- line, an alarm, an attendee, a link, a
+    status, a repeat, a second event, a place or notes, is someone's edit."""
+    if not ics or not uid:
         return False
-    return _as_sent(ics, sent)
+    return not copy_differences(ics, uid, title, start, end)
 
 
 def copy_holds_only_ours(ics: str, uid: str) -> bool:
-    """A Family copy holds nothing but the lines build_copy_ics writes (its uid, start, end and title, the lines
-    servers manage aside), whatever its title and times now say: a write over it, or its removal, loses nothing
-    anyone added (round 4)."""
+    """A Family copy holds nothing but the lines build_copy_ics writes, whatever its title and times now say (the
+    strict allowlist, round 5)."""
     if not ics or not uid or not _is_ours(ics, uid):
         return False
-    events = _events_said(ics)
-    if len(events) != 1:
+    try:
+        have, odd = _copy_said(ics)
+    except (ValueError, TypeError, AttributeError):
         return False
-    (said, defaults), = events.values()
-    names = sorted(re.split(r"[;:]", x, maxsplit=1)[0].upper() for x in (said - defaults).elements())
-    return names == ["DTEND", "DTSTART", "SUMMARY", "UID"]
+    if odd or len(have) != 1 or have[0][0] != uid:
+        return False
+    names = sorted(_name_of(x) for x in have[0][1].elements())
+    return names == ["DTEND", "DTSTART", "SUMMARY", "UID", MARKER]
 
 
 def _uids(ics: str) -> set[str]:
@@ -554,83 +662,30 @@ class FamilyCalDav:
             return None
 
     def put_copy(self, uid: str, title: str, start, end, now: datetime,
-                 etag: str | None = None, data: str = "", *, again: bool = True) -> Outcome:
-        """A copy from Gmail: new, or a change to our own. The uid is fixed per copy, so a
-        write whose answer was lost finds itself on the next try instead of doubling. again=False:
-        a change refused for its version is answered "changed" at once, and the caller reads the
-        copy again and judges it before writing anything more (family_copy._write_ours)."""
-        ready = self._auth()
-        if ready is None:
-            return Outcome("no_credentials")
-        auth, url = ready
-        problem = self._name_problem(auth, url)
-        if problem is not None:
-            return problem
-        href = f"{url}{uid}.ics"
+                 etag: str | None = None, data: str = "") -> Outcome:
+        """A copy from Gmail, new or a change to Harness's own, through the one guarded write (copy_write)."""
+        return self.copy_write(uid, build_copy_ics(uid, title, start, end, now), etag)
+
+    def copy_write(self, uid: str, body: str, etag: str | None) -> Outcome:
+        """The one guarded write of a Harness copy on Family (round 5 of the review of Nov 27). A create (etag None)
+        carries If-None-Match: *, so it never lands over anything; a change carries If-Match with the version that
+        passed the ownership check, and a change with no version is never sent. Nothing is retried here: a 412 is
+        "changed" ("exists" for a create) and a lost answer "unknown", and the caller reads the copy again and runs
+        the allowlist before anything more is written (family_copy.FamilyCopy._guarded)."""
         if etag == "":
-            return Outcome("failed")           # a change to one with no version isn't a new one
-        guard = {"If-Match": etag} if etag else {"If-None-Match": "*"}
-        try:
-            r = self._call(auth, "PUT", href, {**_ICS_HEADERS, **guard},
-                           build_copy_ics(uid, title, start, end, now))
-        except TransportError as e:
-            return Outcome("failed" if e.kind == "blocked" else "unknown")
-        if r.status in (200, 201, 204):
-            return Outcome("ok", r.status, r.headers.get("etag"))
-        if r.status == 412:
-            if etag and not again:
-                return Outcome("changed", r.status)
-            if etag:
-                current = self._current_etag(auth, href, uid, data)
-                if current.kind != "ok":
-                    return current
-                return self._put_again(auth, href, uid, title, start, end, now, current.etag)
-            return self._ours_already(auth, href, uid)
-        if r.status == 401:
-            return Outcome("auth", r.status)
-        return Outcome("unknown" if r.status >= 500 else "failed", r.status)
+            return Outcome("failed")
+        guard = {"If-None-Match": "*"} if etag is None else {"If-Match": etag}
+        out = self._write("PUT", self.href_for(uid), guard, body)
+        if etag is None and out.kind == "changed":
+            return Outcome("exists", out.status)
+        return out
 
-    def _current_etag(self, auth: dict, href: str, uid: str, data: str) -> Outcome:
-        """The ETag of our copy, if it's unchanged from what was just read. Only an answer
-        that shows a difference is "changed": not getting an answer says nothing."""
-        try:
-            r = self._call(auth, "GET", href)
-        except TransportError as e:
-            return Outcome("failed" if e.kind == "blocked" else "unknown")
-        if r.status == 401:
-            return Outcome("auth", r.status)
-        if r.status != 200:
-            return Outcome("unknown" if r.status >= 500 else "failed", r.status)
-        body = r.body.decode("utf-8", "replace")
-        if not (_is_ours(body, uid) and _unchanged(body, data)):
-            return Outcome("changed", r.status)
-        etag = r.headers.get("etag")
-        return Outcome("ok", r.status, etag) if etag else Outcome("failed", r.status)
-
-    def _put_again(self, auth: dict, href: str, uid: str, title: str, start, end, now: datetime,
-                   etag: str) -> Outcome:
-        """Once, with the ETag a GET gave. A second refusal is a real change."""
-        try:
-            r = self._call(auth, "PUT", href, {**_ICS_HEADERS, "If-Match": etag},
-                           build_copy_ics(uid, title, start, end, now))
-        except TransportError as e:
-            return Outcome("failed" if e.kind == "blocked" else "unknown")
-        if r.status in (200, 201, 204):
-            return Outcome("ok", r.status, r.headers.get("etag"))
-        if r.status == 412:
-            return Outcome("changed", r.status)
-        if r.status == 401:
-            return Outcome("auth", r.status)
-        return Outcome("unknown" if r.status >= 500 else "failed", r.status)
-
-    def _ours_already(self, auth: dict, href: str, uid: str) -> Outcome:
-        try:
-            r = self._call(auth, "GET", href)
-        except TransportError:
-            return Outcome("unknown")
-        if r.status == 200 and _is_ours(r.body.decode("utf-8", "replace"), uid):
-            return Outcome("ok", r.status, r.headers.get("etag"))
-        return Outcome("exists", r.status)
+    def copy_delete(self, uid: str, etag: str) -> Outcome:
+        """A Harness copy taken off, only at the version that passed the ownership check (If-Match), never without
+        one. As copy_write: no retry here."""
+        if not etag:
+            return Outcome("failed")
+        return self._write("DELETE", self.href_for(uid), {"If-Match": etag})
 
     def remove_hand_copy(self, href: str, etag: str, data: str = "") -> Outcome:
         """Delete one event he made by hand, taken over from Gmail. Only a plain one-off

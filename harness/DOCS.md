@@ -663,6 +663,16 @@ On Gmail, and then the same on Family:
     tries the status page, `/health` (`waiting`) and the next digest all carry the note that taps wait, and
     that one card came saying taps are waiting and Harness keeps retrying by itself. Put the records back
     and note that the note clears.
+3d. Family copies, as iCloud really keeps them (done by hand, once per install, on the first day): the
+    tests model iCloud's shapes; this checks them on the real shared calendar. Pick four Family copies of
+    your Gmail events over the next week (or add four throwaway appointments to your Gmail calendar and wait
+    a read for their copies). On an iPhone, on the Family calendar, give the first an alert and the second a
+    place picked from the map (so iCloud adds its structured place); after the next read, give the third
+    travel time and change the fourth's title. After each read, the copies changed are named once in the
+    digest as yours to keep, none was written over, and the digest does not say iCloud changed how it keeps
+    events (two at a time never would; if it does, note the line it names). Then move one untouched copy's
+    Gmail event and check its copy follows within a read, and ask about one changed copy and check its Take
+    back card names what changed. Delete the throwaway events after.
 
 Cain's link watching `/health` for its `storage` and `waiting` fields and telling you is separate work, not
 in this build: it is a precondition of turning these handovers on beyond the smoke run, since the digest
@@ -1387,23 +1397,46 @@ and `/status` says if the Gmail calendar isn't being read.
   the copy is read again by its address and judged again before anything more is written; after 2 such
   retries in an hour, or 6 in all for that copy, the copy is left alone and named in the digest.
 - **Harness's own, by an allowlist:** a copy counts as Harness's own only when it holds exactly what
-  Harness writes for it: one event, its id, its title, start and end, and Harness's mark, and nothing more.
-  Lines are compared by what they say, so iCloud's own housekeeping (its stamps and own lines, an alert it
-  marks as its default, times kept in a zone's form or folded across lines) is not an edit. Anything else,
-  an alert, a guest, a link, a status, a repeat, a second event, a place, notes, travel time, or any other
-  line, means someone edited it: the copy is left alone and never written over or taken off, not even by a
-  write that checks its version, and the next digest says once, in one line: "Left alone, yours to keep
-  now: ... I won't change those copies again." A read at the version from before a write of Harness's own
-  is taken as behind only while it holds exactly what Harness had written there.
+  Harness last wrote there: one event, its id, the title, start and end Harness wrote (kept in Harness's own
+  record, never read back from the copy), busy (`TRANSP:OPAQUE`, which Harness writes, and which is also what
+  a copy without that line means) and Harness's mark, and nothing more. Lines are compared by what they say,
+  so times kept in a zone's form with a time zone block beside the event, or folded across lines, are not an
+  edit. Set aside by name, and only these: the stamps (`DTSTAMP`, `LAST-MODIFIED`, `CREATED`, `SEQUENCE`,
+  `PRODID`), iCloud's `X-APPLE-CREATOR-IDENTITY` and `X-APPLE-CREATOR-TEAM-IDENTITY`, and an alert iCloud
+  marks as its default (`X-APPLE-DEFAULT-ALARM:TRUE`) only when what it does is one of iCloud's own two:
+  "none" (`ACTION:NONE` at `19760401T005545Z`) or a 15-minute reminder (`ACTION:DISPLAY`, `TRIGGER:-PT15M`,
+  `DESCRIPTION:Reminder`). Anything else, a changed title or time, an alert, a guest, a link, a status, a
+  repeat, a second event, a place (`LOCATION` or `X-APPLE-STRUCTURED-LOCATION`), notes, travel time
+  (`X-APPLE-TRAVEL-*`), or any other `X-` line, means someone edited it: the copy is left alone and never
+  written over or taken off, and the next digest says once, in one line: "Left alone, yours to keep now:
+  ... I won't change those copies again." A read at the version from before a write of Harness's own is
+  taken as behind only while it holds exactly what Harness had written there.
+- **One guarded write:** every write of a copy, by the sync, a settled write, a reconcile, a fix card's
+  move or removal, a take-back or a retry, goes with `If-Match` on the version that just passed that check
+  (a new copy with `If-None-Match: *`, so it never lands over anything), and never without one. Before it is
+  sent, Harness saves its record of the write: the version and body it goes over and the body it sends. On a
+  412 or a lost answer the copy is read again and judged again by the allowlist; nothing is retried blindly.
+  A write whose record is missing or can't be read leaves the copy alone rather than guess.
+- **Taken off Family:** a copy Harness last saw as its own that is gone from Family was taken off by
+  someone: it's left alone, said once in the digest, and never made again by itself, even if its Gmail
+  event comes back.
+- **Many at once:** when more than two copies stop reading as Harness wrote them in one read, or the same
+  line no person's edit explains turns up on several, the digest says once that it looks like iCloud
+  changing how it keeps events, not people's edits. They're left alone until you take them back.
 - **A write whose answer never came back:** after an hour it's settled by what the copy shows. As written:
   Harness's own. Still the version it went over, holding exactly what Harness had there before: it never
   landed, and the copy gets one more write over that version (counted in the 6). Anything else, a new
   version even one holding what Harness had before, is someone's edit and stays theirs.
 - **The Gmail event read again before each write:** just before a copy is changed, its Gmail event is read
-  again by its id (with the Google key set), and the copy takes that read's times. If the read fails,
-  nothing is written, the digest says so, and the next read tries again. Only Google answering 410 Gone,
-  or the event as cancelled, counts as deleted; a "not found" never does, here or on a fix card. A trip's
-  block (made from several events) and a copy with no Google key go by the calendar's read alone.
+  again by its id (with the Google key set, and `showDeleted=true`), and the copy takes that read's times.
+  For one day of a repeating event that id is the series and the day's original start, moved or not, and an
+  answer for another series or another original start gets no write. The revision that read gave is kept,
+  and the event is read once more after the write: if it moved on meanwhile, the copy is corrected once,
+  after the same checks pass again. If the read fails, nothing is written, the digest says so, and the next
+  read tries again. Only Google answering 410 Gone, or the event as cancelled, counts as deleted; a "not
+  found" never does, here or on a fix card, and three reads in a row of "not found" for one copy are named
+  in the digest. A trip's block (made from several events) and a copy with no Google key go by the
+  calendar's read alone.
 - **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
   family mirrored event not updating"), even as a question, and you get a card that brings that copy back
   to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name
@@ -1414,8 +1447,14 @@ and `/status` says if the Gmail calendar isn't being read.
   plain line. Each card is bound to the copy and its event as it read them, by id and version: at your tap
   both are read again, and if either changed, nothing is written and a fresh card comes instead. Nothing
   asks you to change a calendar by hand. A copy you fixed by hand that already matches its event stays as
-  it is. A fix card never writes over, or takes off, a copy with anything added to it on Family (an alert,
-  a note, a place, a guest, a link): it says the copy is yours to keep and leaves it.
+  it is. A fix card matches the whole copy against what Harness last wrote there, at the card and again just
+  before it writes: one whose title or times were changed, or with anything added (an alert, a note, a
+  place, travel time, a guest, a link), is never written over or taken off; the card says it's yours to keep
+  and leaves it.
+- **Taking a copy back:** for a copy someone changed on Family, asking about it gets a "Take back" card that
+  says what changed (its title, its start, an alert, a place, travel time...) and, only on your tap, writes
+  Harness's copy over it with `If-Match` on exactly the version the card showed. If it changed again since
+  the card, nothing is written and a fresh card comes instead.
 - **Yours by hand:** a matching event with your first name in it is taken over, not doubled. It's
   replaced only when the event changes on Gmail. Events with other people, repeating ones and
   anyone else's are never touched.

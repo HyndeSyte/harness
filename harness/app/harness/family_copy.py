@@ -78,6 +78,21 @@ PENDING_FOR = timedelta(hours=1)
 MAX_RETRIES = 2                # writes again after a conflict, per copy per RETRY_WINDOW
 RETRY_WINDOW = timedelta(hours=1)
 MAX_TOTAL_RETRIES = 6          # writes again (after a conflict, or a write that never landed), per copy, ever
+# Round 5: the copy's ownership baseline is what Harness last wrote there, kept in its own record ("wrote" in
+# VERSION), never what a read of the copy shows. A pending write keeps the version it went over ("from"), the body
+# it went over ("prior_body") and the body it sent ("intended"), all saved before the write is sent; an undecided
+# write whose record is missing a part of that, or can't be read, leaves the copy alone rather than guess.
+PENDING_NEEDS = ("from", "at", "op", "prior_body", "intended")
+LOUD_AFTER = 2                 # more copies than this going hands-off in one read: likely a server change
+MISSING_404S = 3               # Gmail answering "not found" this many reads in a row for one copy: said
+SERVER_CHANGE = "family_copy_server_change"
+MISSING = "family_copy_missing:"      # meta, per copy: how many reads in a row Google answered 404 for its event
+# Edits people make on Family, by line name: anything else that turns up on several copies at once is read as
+# iCloud changing how it keeps events.
+KNOWN_EDITS = frozenset({"SUMMARY", "DTSTART", "DTEND", "LOCATION", "DESCRIPTION", "VALARM", "ATTENDEE", "URL",
+                         "STATUS", "RRULE", "CATEGORIES", "TRANSP", "X-APPLE-TRAVEL-DURATION", "CLASS",
+                         "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR", "X-APPLE-TRAVEL-START", "X-APPLE-STRUCTURED-LOCATION",
+                         "EVENTS", "ORGANIZER", "PRIORITY", "ATTACH", "GEO", "RDATE", "EXDATE"})
 
 
 def source_of(ledger: Ledger, key: str) -> tuple[str, str] | None:
@@ -110,6 +125,26 @@ def google_id(uid: str, instance: str) -> str:
     return f"{base}_{instance}" if instance else base
 
 
+def source_matches(e: dict, uid: str, instance: str) -> bool:
+    """Google's answer for a copy's event is that event (round 5): its iCalUID is the series uid; for one day of a
+    series, its recurringEventId is that series' id and its original start is that day's (a moved day keeps its
+    original start); for a single event, no series at all."""
+    if not isinstance(e, dict) or str(e.get("iCalUID") or uid) != uid:
+        return False
+    base = uid.removesuffix("@google.com")
+    if not instance:
+        return not e.get("recurringEventId")
+    if str(e.get("recurringEventId") or "") != base:
+        return False
+    original = e.get("originalStartTime") or {}
+    try:
+        when = (datetime.fromisoformat(original["dateTime"].replace("Z", "+00:00")) if original.get("dateTime")
+                else date.fromisoformat(original["date"]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+    return ical._key(when) == instance
+
+
 def version(ledger: Ledger, key: str) -> dict:
     try:
         d = json.loads(ledger.get_meta(VERSION + key) or "{}")
@@ -128,29 +163,107 @@ def _shown(fields: tuple) -> dict:
     return {"title": fields[0] or "", "start": _text(fields[1]), "end": _text(fields[2])}
 
 
+def baseline(ledger: Ledger, key: str, row=None) -> tuple | None:
+    """(title, start, end) Harness last wrote on this copy, from its own record (round 5): what a read of the copy
+    is judged against, never values read from the copy. A copy from before this record kept it in its row, which
+    Harness alone writes."""
+    got = pending_fields(version(ledger, key), "wrote")
+    if got is not None:
+        return got
+    if row is None:
+        return None
+    try:
+        return row["title"], _parse(row["start"]), _parse(row["end"])
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+
+
+def set_baseline(ledger: Ledger, key: str, fields: tuple, db=None) -> None:
+    d = version(ledger, key)
+    d["wrote"] = _shown(fields)
+    _set_version(ledger, key, d, db)
+
+
 def note_write(ledger: Ledger, key: str, was: str, got: str = "", *, landed: bool, db=None,
-               wrote: tuple | None = None, before: tuple | None = None) -> None:
+               wrote: tuple | None = None, before: tuple | None = None, prior_body: str | None = None,
+               intended: str | None = None, op: str = "put") -> None:
     """A write of Harness's own to this copy, its own sync's or a change he asked for: sent against `was` (the
-    version just checked), leaving `got` ("" when not known). Not landed: its outcome is still undecided.
-    `wrote`: (title, start, end) as written, kept so an undecided write can be settled by content later.
-    `before`: (title, start, end) the copy held as Harness's own just before, for the decision table (round 4)."""
+    version just checked), leaving `got` ("" when not known). Not landed: its outcome is still undecided, and this
+    is saved (committed) before the write is sent (round 5): the version and body it goes over (`prior_body`) and
+    the body it sends (`intended`). `wrote`: (title, start, end) as written; once landed, that is the copy's new
+    baseline. `before`: (title, start, end) the copy held as Harness's own just before, for the decision table."""
     d = version(ledger, key)
     old = d.get("pending") if isinstance(d.get("pending"), dict) else {}
-    d["pending"] = {"from": was or "", "at": iso(ledger.now()), "landed": bool(landed)}
+    same = old.get("from") == (was or "") and not old.get("landed")
+    d["pending"] = {"from": was or "", "at": iso(ledger.now()), "landed": bool(landed), "op": op}
     if wrote is not None:
         d["pending"]["wrote"] = _shown(wrote)
+    elif same and isinstance(old.get("wrote"), dict):
+        d["pending"]["wrote"] = old["wrote"]
     if before is not None:
         d["pending"]["before"] = _shown(before)
-    elif old.get("from") == (was or "") and isinstance(old.get("before"), dict) and not old.get("landed"):
+    elif same and isinstance(old.get("before"), dict):
         d["pending"]["before"] = old["before"]   # the same write's answer: what it went over stays known
+    for name, value in (("prior_body", prior_body), ("intended", intended)):
+        if value is not None:
+            d["pending"][name] = value
+        elif same and isinstance(old.get(name), str):
+            d["pending"][name] = old[name]
     if landed:
         d["confirmed"] = got or ""
+        if isinstance(d["pending"].get("wrote"), dict) and op != "delete":
+            d["wrote"] = d["pending"]["wrote"]
     _set_version(ledger, key, d, db)
+
+
+def pending_state(ledger: Ledger, key: str) -> tuple[str, dict | None]:
+    """("none", None) with no write undecided; ("ok", it) for an undecided write whose record is whole; ("damaged",
+    None) when the record can't be read or an undecided write's record is missing what it needs (round 5): then
+    the copy is left alone rather than guessed at."""
+    raw = ledger.get_meta(VERSION + key)
+    if not raw:
+        return "none", None
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return "damaged", None
+    if not isinstance(d, dict):
+        return "damaged", None
+    pending = d.get("pending")
+    if pending is None:
+        return "none", None
+    if not isinstance(pending, dict):
+        return "damaged", None
+    if pending.get("landed"):
+        return "none", None
+    if any(not isinstance(pending.get(k), str) for k in PENDING_NEEDS) or (
+            pending.get("op") != "delete" and pending_fields(pending, "wrote") is None):
+        return "damaged", None
+    return "ok", pending
+
+
+def mark_hands_off(ledger: Ledger, key: str, why: str, lines: list[str] | None = None) -> None:
+    """A copy someone changed on Family, found by a card's own check (calendar_change.py): no longer followed, and
+    said once in the digest, as the sync's own _leave does (round 5)."""
+    row = ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (key,)).fetchone()
+    if row is None or row["hand"] or row["state"] not in ("live", "hands_off"):
+        return
+    was = row["state"]
+    detail = {"key": key, "word": row["word"], "start": row["start"], "why": why}
+    if lines:
+        detail["lines"] = [x for x in lines if re.fullmatch(r"[A-Z0-9-]{1,40}", x)][:12]
+    with ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off', updated_at=? WHERE key=?", (iso(ledger.now()), key))
+        if was == "live":
+            ledger.event("family_copy_left_alone", detail, db=db)
+    if was == "live":
+        log.warning("family copy: %s copy of %s not followed (%s)", row["word"], row["start"][:10], why)
 
 
 def settle(ledger: Ledger, key: str, etag: str, own: bool, db=None) -> None:
     """A write of Harness's own decided by the copy's content at this version: as written (own), the version is
-    Harness's; anything else is someone's edit, kept apart and never Harness's own."""
+    Harness's and what it wrote is the copy's baseline; anything else is someone's edit, kept apart and never
+    Harness's own."""
     d = version(ledger, key)
     pending = d.get("pending")
     if isinstance(pending, dict):
@@ -158,6 +271,8 @@ def settle(ledger: Ledger, key: str, etag: str, own: bool, db=None) -> None:
     if own:
         d["confirmed"] = etag or ""
         d.pop("edited", None)
+        if isinstance(pending, dict) and isinstance(pending.get("wrote"), dict) and pending.get("op") != "delete":
+            d["wrote"] = pending["wrote"]
     else:
         d["edited"] = etag or ""
     _set_version(ledger, key, d, db)
@@ -173,6 +288,10 @@ def expired(ledger: Ledger, key: str) -> dict | None:
     except (KeyError, TypeError, ValueError):
         old = True
     return pending if old else None
+
+
+def _parse(value: str):
+    return datetime.fromisoformat(value) if "T" in value else date.fromisoformat(value)
 
 
 def content_is(body: str, uid: str, title: str, start, end, tz: str = "") -> bool:
@@ -285,13 +404,16 @@ READ_SIZE = "family_copy_read_size"
 THIN_READS = "family_copy_thin_reads"
 REVIVED = "family_copy_revived_074"      # a new name gives them one more try after this update
 REVIVE_TRIES = "family_copy_revive_tries_074"
+REVIVE_GONE = "family_copy_revive_gone_074"   # the ones it found taken off: told once, never waited on
 TRIP = "trip"
 CAPPED = ("Copies from Gmail: today's limit of changes is reached, so some wait for tomorrow and "
           "may be wrong until then.")
 _WHY = {"edited": "changed on Family", "changed": "changed on Family",
         "not listed": "Family's list leaves it out", "gone": "no longer on Family",
         "off": "its time doesn't match Gmail", "earlier": "stopped following earlier",
-        "conflicts": "Family kept giving it a new version as I wrote it"}
+        "conflicts": "Family kept giving it a new version as I wrote it",
+        "record": "my record of a write to it couldn't be read, so I didn't guess",
+        "taken back": "taken back on your tap"}
 YOURS = ("edited", "changed")          # someone changed it on Family: his to keep, never written over
 
 # The word on Family, by what the title says. Checked in order.
@@ -516,7 +638,40 @@ class FamilyCopy:
         line = "Copies from Gmail to Family: " + ", ".join(parts) + "." if parts else ""
         problem = self.ledger.get_meta(PROBLEM)
         left = self._left_alone(iso(since) if since else "")
-        return " ".join(x for x in (line, left, problem) if x)
+        return " ".join(x for x in (line, self._server_line(iso(since) if since else ""), left,
+                                    self._not_found_line(iso(since) if since else ""), problem) if x)
+
+    def _server_line(self, since: str) -> str:
+        """Once: many copies at once stopped reading as Harness wrote them (round 5)."""
+        r = self.ledger.db.execute("SELECT detail FROM events WHERE kind=? AND at>=? ORDER BY at DESC LIMIT 1",
+                                   (SERVER_CHANGE, since)).fetchone()
+        if r is None:
+            return ""
+        try:
+            d = json.loads(r["detail"])
+            n, lines = int(d.get("n", 0)), [x for x in d.get("lines", []) if re.fullmatch(r"[A-Z0-9-]{1,40}", x)]
+        except (ValueError, TypeError, AttributeError):
+            n, lines = 0, []
+        what = f", each with a new {', '.join(lines)} line" if lines else ""
+        return (f"Copies from Gmail: {n or 'several'} Family copies stopped reading as I wrote them in one read"
+                f"{what}. That looks like iCloud changing how it keeps events, not people's edits. I left them "
+                "alone; ask me about one to take it back.")
+
+    def _not_found_line(self, since: str) -> str:
+        """A copy whose Gmail event Google keeps answering "not found" for, by name, once (round 5)."""
+        out = []
+        for r in self.ledger.db.execute("SELECT detail FROM events WHERE kind='family_copy_not_found' AND at>=?",
+                                        (since,)):
+            try:
+                d = json.loads(r["detail"])
+                day = _first_day(self._when(d["start"]), ZoneInfo(self.tz))
+                out.append(f"{d['word']} {day:%b} {day.day}")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+        if not out:
+            return ""
+        return ("Copies from Gmail: Google keeps answering \u201cnot found\u201d for the Gmail event of "
+                + ", ".join(sorted(set(out))) + ", so I left those copies as they are.")
 
     # -- each tick -------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
@@ -567,6 +722,13 @@ class FamilyCopy:
                           "changed.")
             return
         self.deleted: set[str] = set()     # his copies removed this read: not there to match
+        self.left_now: list[tuple[str, tuple]] = []    # copies gone hands-off on this read (round 5)
+        try:
+            self._sync_read(feed, family, now, until, name)
+        finally:
+            self._loud()
+
+    def _sync_read(self, feed, family, now: datetime, until: datetime, name: str) -> None:
         self._revive(family, now, until)
         self._tell_once(family)
         occ = feed.ahead.occurrences
@@ -655,11 +817,16 @@ class FamilyCopy:
             if item is None:
                 absent.append((row, want))
                 continue
+            if not row["hand"] and pending_state(self.ledger, row["key"])[0] == "damaged":
+                self._leave(row, "record")         # a write's record can't be read: never guessed at (round 5)
+                continue
             if not row["hand"] and (pending := expired(self.ledger, row["key"])) is not None:
                 row, settled = self._settle_expired(row, item, pending)
                 if settled:
                     continue
                 start, end = self._when(row["start"]), self._when(row["end"])
+            base = None if row["hand"] else (baseline(self.ledger, row["key"], row) or
+                                             (row["title"], start, end))
             if row["hand"]:
                 if not _still_seen(row, item):
                     self._leave(row, "edited")     # not what was taken over any more
@@ -676,13 +843,14 @@ class FamilyCopy:
                 if row["key"] in held:
                     self._unhold(row["key"])
                 continue
-            elif not content_is(item.data, row["uid"], row["title"], start, end):
+            elif not content_is(item.data, row["uid"], *base):
                 before = self._before(row, item)
                 if want is None or not lagging(self.ledger, row["key"], item.etag) or before is None:
                     # Someone edited it, whatever times it shows: theirs now. A read at the version before a
                     # write of Harness's own counts as behind only while it holds exactly what Harness had
-                    # written there; anything added to it is never written over (round 4).
-                    self._leave(row, "edited")
+                    # written there; anything added to it is never written over (round 4). Judged against what
+                    # Harness last wrote, from its own record, never against the copy (round 5).
+                    self._leave(row, "edited", lines=caldav.copy_differences(item.data, row["uid"], *base))
                     continue
                 # The version from before a write of Harness's own still undecided or just sent: this read is
                 # behind, not anyone's edit (Nov 27). Brought to its event, over the version just read.
@@ -776,8 +944,19 @@ class FamilyCopy:
             version, counted against the copy's retry cap;
           * anything else, a new version or anything added: someone's edit. Left alone, never written over."""
         uid, key = row["uid"], row["key"]
-        wrote = pending_fields(pending, "wrote") or (row["title"], self._when(row["start"]), self._when(row["end"]))
         before = pending_fields(pending, "before")
+        if pending.get("op") == "delete":
+            # A removal undecided an hour, and the copy is still there: it never landed if the copy is still the
+            # version it went over, holding exactly Harness's own; anything else is someone's.
+            if before is not None and item.etag and item.etag == pending.get("from") and content_is(item.data, uid,
+                                                                                                    *before):
+                decide(self.ledger, key, landed=False)
+                return row, False
+            settle(self.ledger, key, item.etag, False)
+            self._leave(row, "edited", lines=caldav.copy_differences(item.data, uid, *(before or baseline(
+                self.ledger, key, row))))
+            return row, True
+        wrote = pending_fields(pending, "wrote") or baseline(self.ledger, key, row)
         if content_is(item.data, uid, *wrote):
             settle(self.ledger, key, item.etag, True)
             log.info("family copy: a %s copy's write undecided an hour, settled: landed", row["word"])
@@ -791,7 +970,7 @@ class FamilyCopy:
             return self._as_held(row, before), False
         settle(self.ledger, key, item.etag, False)
         log.info("family copy: a %s copy's write undecided an hour, settled: someone's edit", row["word"])
-        self._leave(row, "edited")
+        self._leave(row, "edited", lines=caldav.copy_differences(item.data, uid, *wrote))
         return row, True
 
     def _as_held(self, row, fields: tuple):
@@ -799,6 +978,7 @@ class FamilyCopy:
         title, start, end = fields
         if (title, _text(start), _text(end)) != (row["title"], row["start"], row["end"]):
             self._update(row, title=title, start=_text(start), end=_text(end))
+        set_baseline(self.ledger, row["key"], fields)     # what the copy is known to hold, as Harness wrote it
         return self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (row["key"],)).fetchone()
 
     def _before(self, row, item) -> tuple | None:
@@ -809,6 +989,7 @@ class FamilyCopy:
         if before is None or not item.etag or pending.get("from") != item.etag:
             return None
         return before if content_is(item.data, row["uid"], *before) else None
+
 
     def _absent(self, absent: list, family_clean: bool) -> str:
         """Gone from Family. One read can be wrong, and so can many gone at once for a while."""
@@ -835,6 +1016,10 @@ class FamilyCopy:
                 self._update(row, missing=row["missing"] + 1)
                 problem = ("Copies from Gmail: what Family listed doesn't match what's on it, so "
                            "I changed nothing. I'll try again.")
+            elif want is None and not row["hand"]:
+                # Gone from Family with no write of Harness's: someone took it off. Left alone and said once, and
+                # never made again by itself, even if its event comes back (round 5).
+                self._leave(row, "gone")
             elif want is None:
                 self._set(row, "cancelled")        # gone on both sides: nothing to learn
             else:
@@ -860,15 +1045,18 @@ class FamilyCopy:
             if not self._room():
                 problem = CAPPED
                 break
-            out = (self.client.remove_hand_copy(item.href, item.etag, item.data) if row["hand"]
-                   else self.client.undo(row["uid"], item.etag, item.data))
-            if out.kind in ("ok", "gone"):
+            if row["hand"]:
+                out = self.client.remove_hand_copy(item.href, item.etag, item.data)
+                kind = out.kind
+            else:
+                kind, out = self._guarded_delete(row, item)
+            if kind in ("ok", "gone"):
                 self.deleted.add(item.href)
                 self._set(row, "cancelled")
                 self._log("family_copy_cancelled", row["key"])
                 self.writes += 1
-            elif out.kind == "changed":
-                self._leave(row, "changed")
+            elif kind in ("changed", "record", "conflicts"):
+                self._leave(row, kind)
             else:
                 problem = self._write_problem(out)
                 break
@@ -887,7 +1075,6 @@ class FamilyCopy:
         self._log("family_copy_removed", row["key"])
 
     def _move(self, row, item, want: Want) -> str:
-        now = self.ledger.now()
         if row["hand"]:
             # Takes over his copy: removed, and ours written in its place.
             out = self.client.remove_hand_copy(item.href, item.etag, item.data)
@@ -898,121 +1085,268 @@ class FamilyCopy:
                 return self._write_problem(out)
             self.deleted.add(item.href)
             uid = _uid(row["key"])
-            out = self.client.put_copy(uid, want.title, want.start, want.end, now)
-            if out.kind != "ok":
+            verdict, out = self._create(row["key"], uid, want)
+            if verdict == "theirs":
+                self._leave(row, "changed")    # something at its address isn't Harness's: never written over
+                return ""
+            if verdict != "ok":
                 self._set(row, "lost")     # his copy is gone and ours isn't there: try anew
                 return self._write_problem(out)
-            note_write(self.ledger, row["key"], "", out.etag or "", landed=True)
             self._moved(row, uid, want)
             return ""
         return self._write_ours(row, item.etag, item.data, want)
 
-    def _write_ours(self, row, etag: str, data: str, want: Want, *, before: tuple | None = None) -> str:
+    def _write_ours(self, row, etag: str, data: str, want: Want, *, before: tuple | None = None,
+                    follow_up: bool = True) -> str:
         """Our own copy brought to its event, only over the version just checked, which holds exactly what Harness
-        wrote there (`before`, by default the row). Its Gmail event is read again by its id first, and the copy
-        takes what that read says (round 4). A conflict (the version moved on) or an answer that's lost is never
-        taken as either way: the copy is read again and judged again before anything more is written, and that's
-        done at most MAX_RETRIES times an hour and MAX_TOTAL_RETRIES ever, then it's left alone and said."""
+        last wrote there (`before`, by default its baseline). Its Gmail event is read again by its id first, and the
+        copy takes what that read says (round 4), and that read's revision is kept: if the event moved on while the
+        copy was written, it's reconciled once, with the ownership and version checks again (round 5). The write
+        goes through the one guarded write (_guarded): a conflict or a lost answer is never taken as either way."""
         uid = row["uid"]
-        before = before or (row["title"], self._when(row["start"]), self._when(row["end"]))
-        want, problem = self._gmail_now(row, want)
+        before = before or baseline(self.ledger, row["key"], row) or (row["title"], self._when(row["start"]),
+                                                                     self._when(row["end"]))
+        want, problem, rev = self._gmail_now(row, want)
         if want is None:
             return problem
         if content_is(data, uid, want.title, want.start, want.end):
             self._moved(row, uid, want)            # already so: the feed was behind the event
             return ""
+        verdict, out = self._guarded(row, etag, data, want, before)
+        if verdict == "ok":
+            self._moved(row, uid, want)
+            if follow_up:
+                return self._reconcile(row, want, rev)
+            return ""
+        if verdict in ("changed", "conflicts", "record"):
+            self._leave(row, verdict)
+            return ""
+        return self._write_problem(out)
+
+    def _guarded(self, row, etag: str, data: str, want: Want, before: tuple) -> tuple[str, caldav.Outcome]:
+        """The one guarded change of a Harness copy (round 5): sent only with If-Match on the version that passed the
+        ownership check, after its record (that version, the body it goes over, the body it sends) is saved. On a
+        412 or a lost answer the copy is read again by its address and the allowlist run again (_judge_again):
+        written (ok), still exactly Harness's own at a version that may be written over (once more, counted against
+        the copy's retry cap), or anything else, left alone. Never retried blindly. Returns (ok | changed |
+        conflicts | record | failed, the last answer)."""
+        uid, key = row["uid"], row["key"]
         while True:
-            note_write(self.ledger, row["key"], etag, landed=False, wrote=(want.title, want.start, want.end),
-                       before=before)
-            out = self.client.put_copy(uid, want.title, want.start, want.end, self.ledger.now(), etag=etag,
-                                       data=data, again=False)
+            body = caldav.build_copy_ics(uid, want.title, want.start, want.end, self.ledger.now())
+            note_write(self.ledger, key, etag, landed=False, wrote=(want.title, want.start, want.end),
+                       before=before, prior_body=data, intended=body, op="put")
+            out = self.client.copy_write(uid, body, etag)
             if out.kind == "ok":
-                note_write(self.ledger, row["key"], etag, out.etag or "", landed=True)
-                self._moved(row, uid, want)
-                return ""
+                note_write(self.ledger, key, etag, out.etag or "", landed=True)
+                return "ok", out
             if out.kind not in ("changed", "unknown"):
-                return self._write_problem(out)
-            verdict, etag, data = self._judge_again(row, want, before, sent_over=etag, lost=out.kind == "unknown")
+                return "failed", out
+            verdict, etag, data = self._judge_again(row, sent_over=etag, lost=out.kind == "unknown")
             log.info("family copy: a %s copy's write answered %s; read again: %s", row["word"], out.kind, verdict)
             if verdict == "landed":                  # its content is what was written (_judge_again)
-                settle(self.ledger, row["key"], etag, True)
-                self._moved(row, uid, want)
-                return ""
+                settle(self.ledger, key, etag, True)
+                return "ok", out
             if verdict == "theirs":
-                self._leave(row, "changed")
-                return ""
+                return "changed", out
+            if verdict == "record":
+                return "record", out
             if verdict != "ours":
-                return self._write_problem(out)      # gone or not read: the next read says
-            if not may_retry(self.ledger, row["key"]):
-                self._leave(row, "conflicts")
-                return ""
+                return "failed", out                 # gone or not read: the next read says
+            if not may_retry(self.ledger, key):
+                return "conflicts", out
 
-    def _gmail_now(self, row, want: Want) -> tuple[Want | None, str]:
+    def _guarded_delete(self, row, item) -> tuple[str, caldav.Outcome]:
+        """The one guarded removal of a Harness copy (round 5): only at the version that passed the ownership check
+        (If-Match), its record saved first; a 412 or a lost answer is read again and the allowlist run again, as
+        _guarded. Returns (ok | gone | changed | conflicts | record | failed, the last answer)."""
+        uid, key = row["uid"], row["key"]
+        base = baseline(self.ledger, key, row)
+        etag, body = item.etag, item.data
+        while True:
+            note_write(self.ledger, key, etag, landed=False, before=base, prior_body=body, intended="", op="delete")
+            out = self.client.copy_delete(uid, etag)
+            if out.kind in ("ok", "gone"):
+                decide(self.ledger, key, landed=True)
+                return out.kind, out
+            if out.kind not in ("changed", "unknown"):
+                return "failed", out
+            back, now_body = self.client.fetch(self.client.href_for(uid))
+            if back.kind == "gone":
+                decide(self.ledger, key, landed=True)
+                return "gone", back
+            if back.kind != "ok" or not now_body or not back.etag:
+                return "failed", out
+            if pending_state(self.ledger, key)[0] != "ok":
+                return "record", out
+            if base is None or not content_is(now_body, uid, *base) or (out.kind == "unknown" and back.etag != etag):
+                return "changed", out
+            decide(self.ledger, key, landed=False)
+            if not may_retry(self.ledger, key):
+                return "conflicts", out
+            etag, body = back.etag, now_body
+
+    def _create(self, key: str, uid: str, want: Want) -> tuple[str, caldav.Outcome]:
+        """A new copy, through the one guarded write: If-None-Match: *, so it never lands over anything, its record
+        saved first. A refusal (something is at its address) or a lost answer is read again: exactly what was
+        written is Harness's own (a lost answer's write found); anything else there is someone's, never written
+        over. Returns (ok | theirs | failed, the answer)."""
+        fields = (want.title, want.start, want.end)
+        body = caldav.build_copy_ics(uid, *fields, self.ledger.now())
+        note_write(self.ledger, key, "", landed=False, wrote=fields, prior_body="", intended=body, op="create")
+        out = self.client.copy_write(uid, body, None)
+        if out.kind == "ok":
+            note_write(self.ledger, key, "", out.etag or "", landed=True)
+            return "ok", out
+        if out.kind not in ("exists", "unknown"):
+            return "failed", out
+        back, got = self.client.fetch(self.client.href_for(uid))
+        if back.kind == "ok" and got and content_is(got, uid, *fields):
+            settle(self.ledger, key, back.etag or "", True)
+            return "ok", caldav.Outcome("ok", back.status, back.etag)
+        if back.kind == "ok" and got:
+            settle(self.ledger, key, back.etag or "", False)
+            return "theirs", out
+        if back.kind == "gone":
+            decide(self.ledger, key, landed=False)
+        return "failed", out
+
+    def _reconcile(self, row, wrote: Want, rev: str) -> str:
+        """Round 5: the Gmail revision the write used is read again just after it. If the event moved on meanwhile,
+        the copy is corrected once, only after the ownership and version checks pass again on a fresh read."""
+        if not rev:
+            return ""
+        kind, e = self._look(row)
+        if kind != "ok" or not isinstance(e, dict) or str(e.get("etag") or "") == rev:
+            return ""
+        occ = self._source_occurrence(row, e)
+        if occ is None or (_same(occ.start, wrote.start) and _same(occ.end, wrote.end)):
+            return ""
+        log.info("family copy: a %s copy's Gmail event moved on while its copy was written: reconciled",
+                 row["word"])
+        back, body = self.client.fetch(self.client.href_for(row["uid"]))
+        if back.kind != "ok" or not body or not back.etag:
+            return ""                                # the next read sees it out of step and writes it then
+        fresh = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (row["key"],)).fetchone()
+        if fresh is None or fresh["state"] != "live":
+            return ""
+        if not content_is(body, row["uid"], wrote.title, wrote.start, wrote.end):
+            self._leave(fresh, "changed", lines=caldav.copy_differences(body, row["uid"], wrote.title, wrote.start,
+                                                                         wrote.end))
+            return ""
+        return self._write_ours(fresh, back.etag, body, replace(wrote, start=occ.start, end=occ.end),
+                                follow_up=False)
+
+    def _gmail_now(self, row, want: Want) -> tuple[Want | None, str, str]:
         """The copy's Gmail event read again by its own id right before the Family write (round 4): (the want with
-        the times that read gives, "") when it's there; (None, "") when Google says it was deleted (only 410 Gone
-        or the event answered as cancelled, google_cal.look_by_id), which the sync's own reads then take off as
-        cancelled; (None, a problem line) when the read can't say. With no Google key, or for a trip (made of
-        several events), the feed's read is all there is."""
+        the times that read gives, "", the event's revision) when it's there; (None, "", "") when Google says it was
+        deleted (only 410 Gone or the event answered as cancelled, google_cal.look_by_id), which the sync's own reads
+        then take off as cancelled; (None, a problem line, "") when the read can't say, or answers for another day
+        or another series than the copy's (round 5). With no Google key, or for a trip (made of several events),
+        the feed's read is all there is."""
+        if not self._looks(row, want):
+            return want, "", ""
+        kind, e = self._look(row)
+        if kind == "deleted":
+            log.info("family copy: a %s copy's Gmail event is gone at the read before the write", row["word"])
+            return None, "", ""
+        occ = self._source_occurrence(row, e) if kind == "ok" else None
+        if occ is None:
+            return None, ("Copies from Gmail: I couldn't read a Gmail event again just before changing its Family "
+                          "copy, so I left that copy for now. I'll try again at the next read."), ""
+        rev = str(e.get("etag") or "")
+        if _same(occ.start, want.start) and _same(occ.end, want.end):
+            return want, "", rev
+        log.info("family copy: a %s copy's Gmail event moved since the feed's read: its newer times are used",
+                 row["word"])
+        return replace(want, start=occ.start, end=occ.end), "", rev
+
+    def _looks(self, row, want: Want | None = None) -> bool:
         google = self.google
-        if google is None or want.word == TRIP or not getattr(google, "configured", lambda: True)():
-            return want, ""
+        if google is None or (want is not None and want.word == TRIP) or row["word"] == TRIP \
+                or not getattr(google, "configured", lambda: True)():
+            return False
+        return bool((self.address_fn() if self.address_fn else "") and source_of(self.ledger, row["key"]))
+
+    def _look(self, row) -> tuple[str, dict | None]:
+        """The copy's Gmail event by the API id its feed item maps to (google_id: the series id and, for one day of
+        a series, that day's original start, moved or not). Google answering "not found" is counted per copy, and
+        several reads in a row of it are said in the digest (round 5)."""
         address = (self.address_fn() if self.address_fn else "") or ""
         ident = source_of(self.ledger, row["key"])
         if not address or ident is None:
-            return want, ""
-        from . import google_cal                  # here: google_cal is a heavy import the copy's tests don't need
+            return "unknown", None
         try:
-            kind, e = google.look_by_id(address, google_id(*ident))
+            kind, e = self.google.look_by_id(address, google_id(*ident))
         except Exception as x:                    # a look is a help, never a stop
             log.warning("family copy: its Gmail event couldn't be read again: %s", type(x).__name__)
-            kind, e = "unknown", None
-        if kind == "deleted":
-            log.info("family copy: a %s copy's Gmail event is gone at the read before the write", row["word"])
-            return None, ""
-        occ = None
-        if kind == "ok" and isinstance(e, dict):
-            try:
-                occ = google_cal._occurrence(e, address, "")
-            except (KeyError, ValueError, TypeError, AttributeError):
-                occ = None
-        if occ is None or _key(occ) != row["key"]:
-            return None, ("Copies from Gmail: I couldn't read a Gmail event again just before changing its Family "
-                          "copy, so I left that copy for now. I'll try again at the next read.")
-        if _same(occ.start, want.start) and _same(occ.end, want.end):
-            return want, ""
-        log.info("family copy: a %s copy's Gmail event moved since the feed's read: its newer times are used",
-                 row["word"])
-        return replace(want, start=occ.start, end=occ.end), ""
+            return "unknown", None
+        self._count_missing(row, kind == "missing")
+        return kind, e
 
-    def _judge_again(self, row, want: Want, before: tuple, *, sent_over: str = "",
-                     lost: bool = False) -> tuple[str, str, str]:
-        """The copy read again by its address after a conflict or a lost answer, judged by the allowlist
-        (content_is): ("landed", its version, body) when it holds exactly what was written; ("ours", ...) when it
-        holds exactly what Harness had there before the write (`before`) and either the write was refused (only
-        its version moved on) or, after a lost answer, it's still the version the write went over (the write
-        didn't land); ("theirs", ...) for anything else, an addition or a new version holding Harness's earlier
-        content (someone putting it back, round 3); or ("gone" | "unread", "", "")."""
+    def _count_missing(self, row, missing: bool) -> None:
+        key = MISSING + row["key"]
+        n = int(self.ledger.get_meta(key) or 0) if missing else 0
+        if not missing and not self.ledger.get_meta(key):
+            return
+        with self.ledger.tx() as db:
+            if missing:
+                self.ledger.set_meta(key, str(n + 1), db)
+            else:
+                db.execute("DELETE FROM meta WHERE key=?", (key,))
+        if missing and n + 1 == MISSING_404S:
+            with self.ledger.tx() as db:
+                self.ledger.event("family_copy_not_found", {"key": row["key"], "word": row["word"],
+                                                           "start": row["start"]}, db=db)
+
+    def _source_occurrence(self, row, e) -> ical.Occurrence | None:
+        """The event Google answered, only if it is the copy's own (round 5): the same series, and for one day of a
+        series, that series by recurringEventId and that day by its original start, wherever the day has moved.
+        Anything else, another series or another day, is None: no write."""
+        ident = source_of(self.ledger, row["key"])
+        if not isinstance(e, dict) or ident is None or not source_matches(e, *ident):
+            return None
+        from . import google_cal                  # here: google_cal is a heavy import the copy's tests don't need
+        try:
+            occ = google_cal._occurrence(e, (self.address_fn() if self.address_fn else "") or "", "")
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return None
+        return occ if occ is not None and _key(occ) == row["key"] else None
+
+    def _judge_again(self, row, *, sent_over: str = "", lost: bool = False) -> tuple[str, str, str]:
+        """The copy read again by its address after a conflict or a lost answer, judged by the allowlist against
+        the write's own saved record (round 5: a record missing or damaged is "record", never guessed at):
+        ("landed", its version, body) when it holds exactly what was written; ("ours", ...) when it holds exactly
+        what Harness had there before the write and either the write was refused (only its version moved on) or,
+        after a lost answer, it's still the version the write went over (the write didn't land); ("theirs", ...)
+        for anything else, an addition or a new version holding Harness's earlier content (someone putting it
+        back, round 3); or ("gone" | "unread", "", "")."""
         back, body = self.client.fetch(self.client.href_for(row["uid"]))
         if back.kind == "gone":
             return "gone", "", ""
         if back.kind != "ok" or not body or not back.etag:
             return "unread", "", ""
+        state, pending = pending_state(self.ledger, row["key"])
+        wrote = pending_fields(pending, "wrote") if state == "ok" else None
+        before = pending_fields(pending, "before") if state == "ok" else None
+        if wrote is None or before is None:
+            return "record", back.etag, body
         uid = row["uid"]
-        if content_is(body, uid, want.title, want.start, want.end):
+        if content_is(body, uid, *wrote):
             return "landed", back.etag, body
         if content_is(body, uid, *before) and (not lost or (sent_over and back.etag == sent_over)):
             return "ours", back.etag, body
         return "theirs", back.etag, body
 
     def _moved(self, row, uid: str, want: Want) -> None:
+        """The copy known to hold exactly this, as Harness wrote it: its record and its baseline (round 5)."""
         self._update(row, uid=uid, hand=0, href="", seen="", title=want.title,
                      start=_text(want.start), end=_text(want.end), missing=0)
+        set_baseline(self.ledger, row["key"], (want.title, want.start, want.end))
         self._log("family_copy_moved", row["key"])
         self.writes += 1
 
     # -- what's new ----------------------------------------------------------------------
     def _add_new(self, wants: dict, sources: dict, family: list, name: str) -> str:
-        now = self.ledger.now()
         stopped = self._stopped_words()
         live = self._live()
         claimed = {caldav.href_path(r["href"]) for r in live if r["hand"]} | {r["uid"] for r in live}
@@ -1044,11 +1378,17 @@ class FamilyCopy:
                 return CAPPED
             # A finished copy is still on Family, so its event needs a new one.
             uid = _uid(f"{key}:{_text(want.start)}") if again else _uid(key)
-            out = self.client.put_copy(uid, want.title, want.start, want.end, now)
-            if out.kind != "ok":
+            verdict, out = self._create(key, uid, want)
+            if verdict == "theirs":
+                # Something is at the copy's own address that isn't Harness's copy as written: someone's.
+                self._insert(key, want, uid, "", hand=0)
+                self._leave(self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (key,)).fetchone(),
+                            "changed")
+                continue
+            if verdict != "ok":
                 return self._write_problem(out)
             self._insert(key, want, uid, "", hand=0)
-            note_write(self.ledger, key, "", out.etag or "", landed=True)
+            set_baseline(self.ledger, key, (want.title, want.start, want.end))
             self._log("family_copy_added", key)
             self.writes += 1
         return ""
@@ -1077,16 +1417,39 @@ class FamilyCopy:
     def _set(self, row, state: str) -> None:
         self._update(row, state=state)
 
-    def _leave(self, row, why: str) -> None:
-        """No longer followed. Never silently: a copy left behind is a wrong calendar."""
+    def _leave(self, row, why: str, *, lines: list[str] | None = None) -> None:
+        """No longer followed. Never silently: a copy left behind is a wrong calendar. `lines`: the names of what
+        differs from what Harness wrote (never what they say), so many alike at once can be told as a server change."""
         self._set(row, "hands_off")
-        self._note(row, why)
+        self._note(row, why, lines)
+        left = getattr(self, "left_now", None)
+        if left is not None:
+            left.append((row["key"], tuple(lines or ())))
 
-    def _note(self, row, why: str) -> None:
-        log.warning("family copy: %s copy of %s not followed (%s)", row["word"], row["start"][:10], why)
+    def _note(self, row, why: str, lines: list[str] | None = None) -> None:
+        log.warning("family copy: %s copy of %s not followed (%s%s)", row["word"], row["start"][:10], why,
+                    f": {','.join(lines)}" if lines else "")
+        detail = {"key": row["key"], "word": row["word"], "start": row["start"], "why": why}
+        if lines:
+            detail["lines"] = [x for x in lines if re.fullmatch(r"[A-Z0-9-]{1,40}", x)][:12]
         with self.ledger.tx() as db:
-            self.ledger.event("family_copy_left_alone", {
-                "key": row["key"], "word": row["word"], "start": row["start"], "why": why}, db=db)
+            self.ledger.event("family_copy_left_alone", detail, db=db)
+
+    def _loud(self) -> None:
+        """Round 5: more than LOUD_AFTER copies going hands-off in one read, or the same line no person's edit
+        explains turning up on several, is said once, as a likely change in how iCloud keeps events, not as edits."""
+        left = getattr(self, "left_now", None) or []
+        if not left:
+            return
+        unknown: dict[str, int] = {}
+        for _, lines in left:
+            for name in set(lines) - KNOWN_EDITS:
+                unknown[name] = unknown.get(name, 0) + 1
+        repeated = sorted(n for n, k in unknown.items() if k >= 2)
+        if len(left) <= LOUD_AFTER and not repeated:
+            return
+        with self.ledger.tx() as db:
+            self.ledger.event(SERVER_CHANGE, {"n": len(left), "lines": repeated[:6]}, db=db)
 
     def _left_alone(self, since: str) -> str:
         """Which ones, each by name and why, in fixed words: a fact, nothing for him to go and do."""
@@ -1126,6 +1489,7 @@ class FamilyCopy:
         if self.ledger.get_meta(REVIVED) or not family.items or family.unreadable:
             return
         unseen = False
+        gone: set[str] = set(json.loads(self.ledger.get_meta(REVIVE_GONE) or "[]"))
         items = {caldav.href_path(i.href): i for i in family.items}
         by_uid = {i.occ.uid: i for i in family.items}
         live = self._live()
@@ -1136,26 +1500,37 @@ class FamilyCopy:
             if self._moment(end) <= now:
                 self._set(row, "done")
                 continue
+            if row["key"] in gone:
+                continue
             path = caldav.href_path(row["href"])
             item = items.get(path) if row["hand"] else by_uid.get(row["uid"])
             if item is None:
+                if not row["hand"] and self._moment(start) < until and self.client.missing([row["uid"]]) == 1:
+                    # Last seen as Harness's own and gone now: someone took it off. Said once, never made again
+                    # by itself, and not waited on (round 5).
+                    gone.add(row["key"])
+                    self._note(row, "gone")
+                    continue
                 unseen = unseen or self._moment(start) < until
                 continue
             claim = path if row["hand"] else row["uid"]
             if claim in held:
                 continue
-            if _still_seen(row, item) if row["hand"] else content_is(item.data, row["uid"], row["title"], start, end):
+            base = None if row["hand"] else (baseline(self.ledger, row["key"], row) or (row["title"], start, end))
+            if _still_seen(row, item) if row["hand"] else content_is(item.data, row["uid"], *base):
                 self._update(row, state="live", missing=0)
                 held.add(claim)
                 log.info("family copy: following a %s copy again", row["word"])
         tries = int(self.ledger.get_meta(REVIVE_TRIES) or 0) + 1
         with self.ledger.tx() as db:
             self.ledger.set_meta(REVIVE_TRIES, str(tries), db)
+            self.ledger.set_meta(REVIVE_GONE, json.dumps(sorted(gone)), db)
         if unseen and tries < HOLD_READS:
             return
         for row in self.ledger.db.execute(
                 "SELECT * FROM family_copies WHERE state='hands_off'").fetchall():
-            self._note(row, "earlier")
+            if row["key"] not in gone:
+                self._note(row, "earlier")
         with self.ledger.tx() as db:
             self.ledger.set_meta(REVIVED, "1", db)
 
