@@ -15,6 +15,10 @@
 //                               refused while the jobs list shows an install or an unrecognized job, or can't be read)
 //   POST /attempt/<id>/drill-mark  (0.1.14) Cain's link only: {mode, to_version, mark}, the link wrote the signed drill mark
 //                               for this accepted drill (mark: its SHA-256); a drill record needs it
+//   POST /backup-first  (0.1.19) Cain's App only: {app, pr, head, request, nonce, main, to_version}, idempotent by request; Cain's backup made now, at the owner's Ship tap, for the
+//                       registration of that pull request and head that follows (answered 202; the backup stops and starts Cain)
+//   GET  /backup-first  (0.1.19) Cain's App only: ?app=<slug>&request=<id>, where that request's backup stands (making, ready
+//                       with verified, failed, consumed or unknown), the newest restore Keeper can see, and backup_first: 1
 //   POST /verdict   {app, version, attempt, result: PASS|FAIL, reason}: the caller's App's probe verdict
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
 //                   version and a timestamp refreshed every minute (0.1.8: under the claim record's lock)
@@ -96,6 +100,14 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
     if (b === undefined || !b || typeof b !== "object") return json({ status: "refused", why: "not JSON" }, 400);
     const r = m[2] === "/drill-mark" ? k.markAttempt(caller, m[1], b)                                     // (0.1.14)
       : m[2] === "/claim" ? await k.claim(caller, m[1], b) : await k.cancel(caller, m[1], b);   // (0.1.7) under the claim record's lock
+    return json(r.body, r.status);
+  }
+  // (0.1.19) Cain's backup taken first, at the owner's Ship tap (core.ts backupFirst), and where it stands
+  if (url.pathname === "/backup-first" && req.method === "GET") { const r = await k.firstView(caller, url.searchParams.get("app") || caller || "", url.searchParams.get("request") || ""); return json(r.body, r.status); }
+  if (url.pathname === "/backup-first" && req.method === "POST") {
+    const b = await body(req);
+    if (b === undefined || !b || typeof b !== "object") return json({ status: "refused", why: "not JSON" }, 400);
+    const r = await k.backupFirst(caller, b);
     return json(r.body, r.status);
   }
   if (req.method === "POST" && url.pathname === "/attempt") {

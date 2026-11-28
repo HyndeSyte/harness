@@ -81,6 +81,7 @@
 //   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
 //   Stop then goes onto a newer message, the notice's comes off.
 import { createHash } from "node:crypto";
+import { type FirstDeps, type FirstTap, mintHex, tapAge, TAP_WINDOW_MS } from "./backup-first";
 import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
@@ -374,7 +375,8 @@ export interface Shown {
   // words before it, for the line that says how it went.
   shipping?: { state: "landing" | "landed" | "not landed"; at: number; text: string; why?: string;
     tries?: number; next?: number;    // it can't land yet: how often it was tried, and when it's tried next
-    line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
+    line?: string; edited?: boolean;  // the line his card shows now, and whether Discord took that edit
+    first?: number };                 // (Cain 0.19.4) an install of Cain: his tap recorded at this time for the backup first (backup-first.ts)
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
   rotation?: { id: string };        // the link's card for the keeper's old Healthchecks key (Keeper 0.1.9, rotation.ts)
@@ -734,6 +736,8 @@ export interface Deps {
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
+  // (Cain 0.19.4) an install of Cain: his tap recorded and the Keeper's backup asked first, the token only after (backup-first.ts)
+  backupFirst?: FirstDeps;
   // Keeper 0.1.9: his tap on the rotation card, signed by the link's Ship key and sent to the keeper (rotation.ts)
   attestRotation?: (id: string) => Promise<{ ok: boolean; why: string }>;
   // Keeper 0.1.13: his tap on the drill card, signed by the link's Ship key and kept by root as the drill flag (drill.ts armFlag)
@@ -852,6 +856,9 @@ export const IN_MAIN = "Already in main, so Ship only installs it.";
 export const MERGED_UNREAD = "Merged on GitHub; Ship checks main has it before anything installs.";
 // The last line when Cain names no review: none is attached, which isn't to say none happened.
 export const NO_REVIEW = "No outside review attached.";
+// (Cain 0.19.4) Cain's Ship card for himself, when the Keeper doesn't back him up first (an older Keeper) or can't be asked
+export const FIRST_MISSING = "The Keeper here doesn't back Cain up first yet, so this tap won't install Cain: install the new Keeper first.";
+export const FIRST_UNREAD = "The Keeper didn't say whether it backs Cain up first: if it doesn't, this tap won't install Cain.";
 
 // The link's line from GitHub (0.11.0): how much it changes and the parts that matter most,
 // then the checks. The pull request's title isn't shown: it's free text from whoever opened
@@ -2581,7 +2588,11 @@ export class Link {
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
-      return { text: shipCard(shipQuestion(f), own, [github, rev ? `${rev.line} ${REVIEW_READ}` : NO_REVIEW]), own };
+      // (Cain 0.19.4) an install of Cain needs a Keeper that backs him up first: the card checks the Keeper serves it, and says so if not
+      const self = f?.bumps?.some((b) => b.app === "Cain") && this.d.backupFirst?.advertised
+        ? await within(this.d.backupFirst.advertised().catch(() => null), wait) : true;
+      const firstLine = self === false ? [FIRST_MISSING] : self === null ? [FIRST_UNREAD] : [];
+      return { text: shipCard(shipQuestion(f), own, [github, ...firstLine, rev ? `${rev.line} ${REVIEW_READ}` : NO_REVIEW]), own };
     } catch (e) {
       if (e instanceof Refusal) throw e;
       this.log(`couldn't build a Ship card's new lines, so it goes as it was: ${reason(e)}`);
@@ -3572,6 +3583,18 @@ export class Link {
   // doesn't answer, or its checks are still running, it's tried again (the sweep), for
   // up to 2 hours after his tap, and his card says what it waits on.
   private async settleLanding(msgId: string, r: Landed): Promise<void> {
+    // (Cain 0.19.4) Does this tap install Cain, and what will actually install (main's commit and Cain's version there)? Read before
+    // the state is, so nothing written meanwhile is lost. Can't tell: today's path, and the Keeper refuses Cain's install without a
+    // backup first (fail closed), so only the other Apps' installs go.
+    let first: { version: string; main: { sha: string; version: string } | null } | null = null;
+    if (r.ok && this.d.backupFirst && this.d.signShip) {
+      const m0 = this.d.load().messages[msgId];
+      if (m0?.ship && m0.shipping?.state === "landing" && !this.voided(m0.shipping.at) && this.d.now() - m0.shipping.at < LANDING_TRY_MS) {
+        const need = await this.d.backupFirst.installsCain(m0.ship).catch(() => null);
+        if (need === null) this.log("couldn't tell whether his Ship tap installs Cain: its token goes out as for any App (the Keeper refuses an install of Cain without its backup first)");
+        if (need) first = { version: need, main: await this.d.backupFirst.mainNow(m0.ship).catch(() => null) };
+      }
+    }
     const s = this.d.load();
     const m = s.messages[msgId];
     if (!m?.ship || m.shipping?.state !== "landing") return;
@@ -3599,6 +3622,34 @@ export class Link {
     let shown: string, line: string;
     if (r.ok) {
       const stopped = this.stopped().stopped, voided = this.voided(tapped), late = now - tapped >= LANDING_TRY_MS;
+      // (Cain 0.19.4) an install of Cain: only his tap is recorded now (with a fresh nonce and request id), and the token waits for
+      // the Keeper's word that the backup taken first is verified (backup-first.ts)
+      if (first && !voided && !late) {
+        const bf = this.d.backupFirst!;
+        const hex = bf.random ?? mintHex;
+        let tapRec: FirstTap | null = null, why = "";
+        if (!first.main) why = "main's commit couldn't be read, so what installs isn't known";
+        else if (first.main.version !== first.version) why = `main has Cain ${first.main.version}, not the ${first.version} his card installs`;
+        else {
+          tapRec = { v: 2, pr: m.ship.pr, head: m.ship.head, msg: msgId, at: now, nonce: hex(16), request: hex(8), main: first.main.sha, version: first.version };
+          // the mark first, then the tap: both on disk before the Keeper is asked
+          try { bf.store.setMark(tapRec.nonce); bf.store.store(tapRec); }
+          catch (e) { this.log(`couldn't record his Ship tap for the backup first: ${String(e).slice(0, 80)}`); tapRec = null; why = "the link couldn't record his tap for the backup first"; }
+        }
+        shown = tapRec ? `Shipped: it's in main as of ${clockTime(now, this.d.tz)}. Before installing, the Keeper backs Cain up, which restarts him for a minute or two; then installing is next. If that backup can't be used, installing needs a new Ship tap.`
+          : own(`Shipped: it's in main as of ${clockTime(now, this.d.tz)}, but not installed: ${why}. Installing it needs a new Ship tap.`);
+        line = `${tap} The link landed it: main has that commit now${r.already ? " (it was there already)" : ""}.` + (tapRec
+          ? " It installs Cain, so the Keeper backs Cain up first, which stops and starts Cain and this session. There's no Ship token yet: once Cain is back and the Keeper says that backup is verified, the link sends it in a line of its own; start the Ship job then, with that token. Nothing to tell him now: his card says so."
+          : ` There's no Ship token: ${why}, so it isn't installed. Tell him in one line that it's in main but not installed, and show a new Ship card for the same pull request and head.`);
+        m.shipping = { state: "landed", at: now, text: words, line: shown, edited: false, ...(tapRec ? { first: tapRec.at } : {}) };
+        m.digest = digest(withLine(words, shown), []);
+        this.d.save(s);
+        this.d.relay(line);
+        this.log(`his Ship tap landed ${m.ship.pr} in main; it installs Cain, so ${tapRec ? `the Keeper backs him up first (request ${tapRec.request}, main ${tapRec.main.slice(0, 12)}, Cain ${tapRec.version})` : `nothing installs: ${why}`}`);
+        await this.showLanding(msgId);
+        if (tapRec) await this.askFirst(msgId, m.ship, tapRec);
+        return;
+      }
       const token = voided || late ? null : this.signFor(m.ship);
       shown = `Shipped: it's in main as of ${clockTime(now, this.d.tz)}. ${stopped ? "Installing it waits until you turn things back on."
         : voided ? "Installing it needs your tap again, since you tapped Stop meanwhile."
@@ -3625,6 +3676,116 @@ export class Link {
     this.d.relay(line);
     this.log(r.ok ? `his Ship tap landed ${m.ship.pr} in main` : `his Ship tap didn't land ${m.ship.pr}: ${r.why}`);
     await this.showLanding(msgId);
+  }
+
+  // -- backup first (Cain 0.19.4, backup-first.ts) ---------------------------------
+  // The Keeper is asked to back Cain up once his tap is recorded and Cain has heard. Its backup stops and starts Cain, so this
+  // may be the last thing this process does; a refusal ends the tap at once. POST's answer never issues the token.
+  private async askFirst(msgId: string, ship: { pr: string; head: string }, tap: FirstTap): Promise<void> {
+    const bf = this.d.backupFirst!;
+    const ans = await bf.ask(ship, tap).catch(() => ({ ok: false as const, why: "the Keeper didn't answer" }));
+    if (ans.ok) { this.log(`asked the Keeper to back Cain up first for ${ship.pr} (request ${tap.request}); backup first timing: tap to ask answered ${tapAge(this.d.now(), tap.at)}`); return; }
+    this.discardFirst(tap, `the Keeper couldn't back Cain up first: ${"why" in ans ? ans.why : "no reason"}`);
+  }
+
+  // A recorded tap that gets no token: removed (its nonce marked used, so it never counts again), his card says so, and Cain hears
+  // one line.
+  private discardFirst(tap: FirstTap, why: string): void {
+    const bf = this.d.backupFirst!;
+    try { if ((bf.store.used() ?? []).every((u) => u.nonce !== tap.nonce)) bf.store.markUsed({ nonce: tap.nonce, pr: tap.pr, head: tap.head, exp: 0, main: tap.main, version: tap.version, at: this.d.now() }); }
+    catch { /* the tap file goes anyway; the Keeper keeps the nonce's own record */ }
+    try { const cur = bf.store.load(); if (cur === "unreadable" || cur?.nonce === tap.nonce) bf.store.drop(); } catch { /* its window ends it */ }
+    this.firstWaitSaid = "";
+    this.endFirst(tap.msg, why);
+  }
+  private firstWaitSaid = "";
+
+  // His card says the tap gets no token, and Cain hears one line.
+  private endFirst(msgId: string, why: string): void {
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    const own = (t: string) => this.words("ship line", "link", t, { rules: AT.link }).text;
+    this.log(`his recorded Ship tap gets no token: ${why}`);
+    if (m?.ship && m.shipping?.first) {
+      const shown = own(`Shipped: it's in main, but not installed: ${why}. Installing it needs a new Ship tap.`);
+      m.shipping = { ...m.shipping, line: shown, edited: false };
+      m.digest = digest(withLine(m.shipping.text, shown), []);
+      this.d.save(s);
+      void this.showLanding(msgId);
+    }
+    this.d.relay(`His Ship tap${m?.ship ? ` on ${m.ship.pr}` : ""} gets no Ship token: ${why}. Nothing was installed. Tell him in one line, and show a new Ship card for the same pull request and head: his tap on it starts again.`);
+  }
+
+  // At start and at every sweep. The token goes out only on the Keeper's word for this very request (GET /backup-first): ready,
+  // verified and unconsumed. Pending waits within the tap's window; anything else discards the tap. Before the token: his card, no
+  // Stop, no restore, the head and main's commit and version unchanged; then the crash-safe consume (useTap), then the token.
+  private async resumeFirst(): Promise<void> {
+    const bf = this.d.backupFirst;
+    if (!bf) return;
+    let tap: FirstTap | null | "unreadable";
+    try { tap = bf.store.load(); } catch { tap = "unreadable"; }
+    if (tap === null) return;
+    if (tap === "unreadable") {
+      try { bf.store.drop(); } catch { /* tried again at the next sweep */ }
+      this.log("the recorded Ship tap couldn't be read: removed, and no token");
+      this.d.relay("The link's record of a Ship tap for the backup first couldn't be read, so no Ship token went out and nothing was installed. Show a new Ship card for that pull request and head: his tap on it starts again.");
+      return;
+    }
+    const now = this.d.now();
+    if (bf.store.mark() !== tap.nonce) return this.discardFirst(tap, "Cain was restored from a backup since his tap");
+    if (now - tap.at > TAP_WINDOW_MS) return this.discardFirst(tap, `his recorded tap is over ${TAP_WINDOW_MS / 60_000} minutes old`);
+    const m = this.d.load().messages[tap.msg];
+    if (!m?.ship || m.ship.pr !== tap.pr || m.ship.head !== tap.head || m.shipping?.first !== tap.at) return this.discardFirst(tap, "the recorded tap isn't the one on his card");
+    if (this.voided(tap.at)) return this.discardFirst(tap, "he tapped Stop since");
+    const st = await bf.status(tap.request).catch(() => null);
+    if (st?.restoredAt && st.restoredAt >= tap.at) return this.discardFirst(tap, "the Keeper saw a restore of Cain since his tap");
+    if (st === null || st.status === "making") {
+      const said = `${tap.request}:${st ? "making" : "none"}`;
+      if (this.firstWaitSaid !== said) { this.firstWaitSaid = said; this.log(`the backup first for ${tap.pr} (request ${tap.request}) ${st ? "is still being made" : "has no word from the Keeper yet"}: waiting, within ${TAP_WINDOW_MS / 60_000} minutes of his tap`); }
+      return;
+    }
+    if (st.status !== "ready" || st.verified !== true || st.request !== tap.request)
+      return this.discardFirst(tap, `the Keeper's backup first ${st.status === "ready" ? "isn't verified for this tap" : `is ${st.status}`}${st.why ? ` (${st.why})` : ""}`);
+    if (st.windowMs !== undefined && st.windowMs !== TAP_WINDOW_MS) this.log(`the Keeper's tap window (${st.windowMs} ms) isn't the link's (${TAP_WINDOW_MS} ms): the shorter one decides`);
+    const head = await bf.head(m.ship).catch(() => null);
+    if (head !== tap.head) return this.discardFirst(tap, head === null ? "the pull request's head couldn't be read" : "the pull request's head moved since his tap");
+    const main = await bf.mainNow(m.ship).catch(() => null);
+    if (!main) return this.discardFirst(tap, "main's commit couldn't be read, so what installs isn't known");
+    if (main.sha !== tap.main || main.version !== tap.version) return this.discardFirst(tap, "main moved since his tap, so what installs isn't what he tapped");
+    const at = this.d.now();
+    const claim = claimFor(m.ship.pr, m.ship.head, at);
+    if (!claim || !this.d.signShip) return this.discardFirst(tap, "the link has no Ship key");
+    const used = this.useTap(tap, claim.exp);
+    if (used !== "ok") { this.firstWaitSaid = ""; return this.endFirst(tap.msg, used); }
+    let token: string | null = null;
+    try { token = this.d.signShip(claim); } catch (e) { this.log(`couldn't sign a Ship tap: ${String(e).slice(0, 80)}`); }
+    if (!token) return this.endFirst(tap.msg, "the link couldn't sign its Ship token");
+    const s = this.d.load();
+    const m2 = s.messages[tap.msg];
+    if (m2?.shipping) {
+      const shown = `Shipped: it's in main, and Cain is backed up as of ${clockTime(now, this.d.tz)}. Installing it is next.`;
+      m2.shipping = { ...m2.shipping, line: shown, edited: false };
+      m2.digest = digest(withLine(m2.shipping.text, shown), []);
+      this.d.save(s);
+    }
+    this.d.relay(`${this.tapLine(m, "Ship", tap.msg)} Cain is back after the Keeper's backup, so the install can go. Ship token: ${token} (good for 2 hours): start the Ship job now to install it, with that token in its text as it is.`);
+    this.log(`his recorded Ship tap on ${m.ship.pr} got its token after the backup first; backup first timing: tap to link start ${tapAge(bf.booted, tap.at)}, tap to token ${tapAge(at, tap.at)}`);
+    this.firstWaitSaid = "";
+    await this.showLanding(tap.msg);
+  }
+
+  // The consume, crash-safe and in this order: the nonce appended to the used list (file and folder synced), then the tap file
+  // removed (folder synced); only then may the token go. "ok", or why it can't count. A crash anywhere before the token leaves
+  // the nonce used, so a re-read issues nothing.
+  private useTap(tap: FirstTap, exp: number): "ok" | string {
+    const bf = this.d.backupFirst!;
+    const before = (() => { try { return bf.store.used(); } catch { return null; } })();
+    if (before === null) { try { bf.store.drop(); } catch { /* its window ends it */ } return "the link's list of used taps couldn't be read"; }
+    if (before.some((u) => u.nonce === tap.nonce)) { try { bf.store.drop(); } catch { /* its window ends it */ } return "that recorded tap was used before"; }
+    try { bf.store.markUsed({ nonce: tap.nonce, pr: tap.pr, head: tap.head, exp, main: tap.main, version: tap.version, at: this.d.now() }); }
+    catch (e) { this.log(`couldn't record the tap as used: ${String(e).slice(0, 80)}`); try { bf.store.drop(); } catch { /* its window ends it */ } return "the link couldn't record the tap as used"; }
+    try { bf.store.drop(); } catch (e) { this.log(`couldn't remove the recorded Ship tap: ${String(e).slice(0, 80)}`); return "the link couldn't remove its record of the tap"; }
+    return "ok";
   }
 
   // His card as the landing last left it, with no buttons. Edited with the bot's own key,
@@ -3967,6 +4128,7 @@ export class Link {
       this.backfillLabels();
       await this.sendOwedToggle();
       await this.retryLandings();
+      await this.resumeFirst();                          // (Cain 0.19.4) a tap recorded for the backup first
       await this.retryDecisions();
       this.capSweep();
       await this.checkKey();

@@ -184,6 +184,28 @@ service recorded them, for a review of the change as it is now, with a note that
 reviewers read Cain's summary of it, not the code; or "No outside review attached." Cain's own line says only what you'll notice. Cards and Cain's messages never
 show item codes.
 
+**An update of Cain himself (since 0.19.4).** Cain's backup stops and starts Cain, so it can't be
+taken in the middle of his own install. When your Ship tap is for a change that updates Cain, the App
+lands it in main as usual, reads what will actually install (main's commit and Cain's version there,
+which must be your card's), and writes down only your tap with a fresh one-time code for it. Then it asks
+the Keeper to back Cain up right away, under that code. Cain restarts for a minute or two. The App gives
+Cain the go for that tap, once, only when the Keeper says the backup for that very code is made, checked
+and unused; it then marks the code used on disk before anything else, so a crash can never give the go
+twice. The install goes on as for any other App, and the Keeper lets only the install carrying that code
+use the backup, once. The card says this while it happens. Your tap gets no go, and a new Ship tap is
+needed, when it is over 10 minutes old, when the change or main moved on since, when you tapped Stop or
+tapped Ship again meanwhile (only the newest tap counts), when Cain was restored from a backup since, or
+when the Keeper couldn't make or check the backup: Cain tells you in one line and the card says so.
+
+Your written-down tap and the list of used codes are left out of Home Assistant's backups. A restore of
+an App through the Supervisor removes the App's data folder and puts the backup's in its place (the
+Supervisor's restore code, `addons/addon.py`; not yet watched on the Pi), so those left-out files are
+deleted by a restore, not kept, and a restored Cain has no tap to resume. Beside them the App keeps a small
+mark of the newest tap's code that is in the backups on purpose: a restore of a backup from before the tap
+brings back a mark without that code, and the App throws the tap away. The Keeper also refuses a backup
+from before any restore it can see. Changes that don't update Cain ship as before. When the Keeper here is
+older and can't back Cain up first, the Ship card for an update of Cain says so.
+
 Both keys are kept by the App and left out of Home Assistant's backups. Cain's tools
 are barred from them, and once his session runs as its own user (the next step) he
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy

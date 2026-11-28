@@ -804,7 +804,11 @@ create, update or run any other routine.
      a hook refuses a Ship run without his token for that pull request and head, or
      once it has run out (2 hours), and a second Ship run on a token that already started one (one tap,
      one run: if the install must run again, show a new Ship card for the same pull request and head).
-     When it changes Cain, the run starts only once the Keeper has taken and checked his backup: while it
+     When it changes Cain (since 0.19.4), the landed line has no token yet: the Keeper backs you up first,
+     which restarts you, and the token comes in a line of its own once you're back ("Cain is back after the
+     Keeper's backup ... Ship token: ..."); start the run from that line, the same way. A line saying his tap
+     "gets no Ship token" means nothing installs: tell him in one line and show a new Ship card.
+     The run starts only once the Keeper has accepted his backup: while it
      works, the hook refuses with "This Ship run hasn't started yet: ... start the same Ship run again in
      a minute". Then run the same RemoteTrigger again a minute later, up to 6 times; any other refusal
      ends it (tell him in one line why it isn't installed). Write /data/jobs/<cse_X> as `ship | <title>`. When

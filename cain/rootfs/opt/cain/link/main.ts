@@ -64,7 +64,7 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
+import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, syncFolder, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
@@ -75,13 +75,14 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { bumpsAt, facts, headChecks, inMain, land, type MergeDeps, versionAt } from "./merge";
+import { CAIN_SLUG, fileFirstStore, type FirstDeps, judgeAsk, judgeStatus, usedFor } from "./backup-first";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
+import { APP_SLUGS, type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses, WATCHED } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -252,8 +253,56 @@ const drillStore = linkDrillStore(process.env, TRUST_DIR, DIR, Date.now);   // K
 const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
 const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
 if (drillKey) { try { storeMarkPub(drillKey.pub, DRILL_MARK_PUB); } catch (e) { console.log(`[cain] link: couldn't keep the drill key's public half: ${String(e).slice(0, 80)}`); } }
+// Cain 0.19.4: backup first (backup-first.ts). His Ship tap for an install of Cain is recorded in root's /data/trust (the used taps
+// in the link's own folder), both left out of Cain's backups, and its restore mark beside them, kept in the backups on purpose; the
+// Keeper backs Cain up at the tap, and the token goes out only on the Keeper's word that the backup is verified.
+const BOOTED = Date.now();
+const firstStore = fileFirstStore(process.env.CAIN_BACKUP_FIRST ?? `${TRUST_DIR}/backup-first.json`, process.env.CAIN_BACKUP_FIRST_USED ?? `${DIR}/backup-first-used.json`,
+  process.env.CAIN_BACKUP_FIRST_MARK ?? `${DIR}/backup-first-mark.json`, writeSynced, syncFolder);
+async function pullNowOf(ship: { pr: string }): Promise<{ repo: string; pr: number; body: any } | null> {
+  const p = pullOf(ship.pr);
+  if (!p) return null;
+  const r = await githubApi(`/repos/${p.repo}/pulls/${p.pr}`).catch(() => null);
+  return r?.status === 200 ? { ...p, body: r.body } : null;
+}
+// main's commit now, and Cain's version in it: what an install actually installs (Home Assistant installs main)
+async function mainNowOf(repo: string): Promise<{ sha: string; version: string } | null> {
+  const r = await githubApi(`/repos/${repo}/branches/main`).catch(() => null);
+  const sha = String(r?.status === 200 ? r.body?.commit?.sha ?? "" : "").toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(sha)) return null;
+  const v = await versionAt(github, repo, "cain/config.yaml", sha);
+  return v && v !== "none" ? { sha, version: v } : null;
+}
+const backupFirst: FirstDeps = {
+  store: firstStore, booted: BOOTED,
+  // what the tap installs, read as the Ship pass reads it (ship-pass.ts registerInstalls): Cain bumped between the base and the head
+  installsCain: async (ship) => {
+    if (!WATCHED.has(CAIN_SLUG)) return false;
+    const p = await pullNowOf(ship);
+    const base = String(p?.body?.base?.sha ?? "");
+    if (!p || !/^[0-9a-f]{40}$/.test(base)) return null;
+    const b = await bumpsAt(github, p.repo, base, ship.head);
+    if (!b) return null;
+    return b.find((x) => APP_SLUGS[x.app] === CAIN_SLUG)?.version ?? false;
+  },
+  mainNow: async (ship) => { const p = pullOf(ship.pr); return p ? mainNowOf(p.repo) : null; },
+  ask: async (ship, tap) => {
+    const p = pullOf(ship.pr);
+    if (!p) return { ok: false as const, why: "that isn't a pull request's address" };
+    if (!KEEPER_TOKEN) return { ok: false as const, why: "no keeper_token is set" };
+    return judgeAsk(await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/backup-first",
+      { app: CAIN_SLUG, pr: p.pr, head: ship.head, request: tap.request, nonce: tap.nonce, main: tap.main, to_version: tap.version }));
+  },
+  status: async (request) => KEEPER_TOKEN ? judgeStatus(await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/backup-first?app=${CAIN_SLUG}&request=${encodeURIComponent(request)}`)) : null,
+  advertised: async () => {
+    if (!KEEPER_TOKEN) return null;
+    const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/backup-first?app=${CAIN_SLUG}`, undefined, 3_000);
+    return !r ? null : r.status === 200 && r.body?.backup_first === 1 ? true : r.status === 404 || r.status === 200 ? false : null;
+  },
+  head: async (ship) => { const p = await pullNowOf(ship); const h = String(p?.body?.head?.sha ?? ""); return /^[0-9a-f]{40}$/.test(h) ? h : null; },
+};
 const link = new Link({
-  rest, load, save, now: Date.now, paired, toHarness,
+  rest, load, save, now: Date.now, paired, toHarness, backupFirst,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   // Durable (C1 re-check N2): a card's line to Cain is on disk before the card's request is done.
   relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
@@ -447,7 +496,7 @@ const shipPassDeps: PassDeps = {
   register: (tok, claim, done, note) => {
     const pub = shipPub();
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
-      post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
+      post: (body) => keeperPost("/attempt", body), drill, first: (c) => usedFor(firstStore.used(), c), markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)
@@ -455,7 +504,13 @@ const shipPassDeps: PassDeps = {
   },
   // 3 seconds: the hook waits on the pass (about 8 seconds a request), so the claim must answer well within it.
   // Keeper 0.1.7: with the claim's request id, so a retry reads the recorded claim.
-  claim: (a, request) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, request }, 3_000) : Promise.resolve(null),
+  // Cain 0.19.4: a claim of an install backed up first carries main's commit read now, which must still be the one the tap recorded
+  claim: async (a, request) => {
+    if (!KEEPER_TOKEN) return null;
+    const main = a.main ? await Promise.race([mainNowOf("HyndeSyte/harness").then((m) => m?.sha ?? ""), Bun.sleep(2_000).then(() => "")]) : undefined;
+    if (a.main && !main) return { status: 0, body: { status: "refused", why: "main's commit couldn't be read right before the claim" } };
+    return keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, request, ...(main ? { main } : {}) }, 3_000);
+  },
   // Keeper 0.1.11: the cancel's answer is judged (ship-pass.ts judgeCancel); anything but a plain "ended" brings the retry card
   cancel: (attempt, why) => keeperPost(`/attempt/${attempt}/cancel`, { why }),
   dropMark: (attempt) => drill.drop(attempt),

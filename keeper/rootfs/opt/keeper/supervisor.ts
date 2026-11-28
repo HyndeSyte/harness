@@ -140,6 +140,19 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       walk(r.data.jobs);
       return out;
     },
+    // (0.1.19) The newest restore job's start in the jobs list (done or not, any App: a restore by hand through Home Assistant
+    // included), 0 when it lists none. Null when the list can't be read. The list holds only jobs since the Supervisor started.
+    async restoreSeenAt(): Promise<number | null> {
+      const r = await call("GET", "/jobs/info").catch(() => null);
+      if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
+      let best = 0;
+      const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
+        const t = typeof x.created === "string" ? Date.parse(x.created) : NaN;
+        if (typeof x.name === "string" && /restore/i.test(x.name)) best = Math.max(best, Number.isFinite(t) ? t : x.done !== true ? Date.now() : 0);
+        if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
+      walk(r.data.jobs);
+      return best;
+    },
     // (0.1.16) The Supervisor's running backup jobs (a create, a restore, a delete: names with "backup"), from the jobs list; the
     // reconcile of a late operation waits until none runs. Null when the list can't be read.
     async backupJobs(): Promise<string[] | null> {

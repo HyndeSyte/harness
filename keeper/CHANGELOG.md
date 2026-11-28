@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.19
+
+- Fixed: Cain's own updates. Cain's backup stops and starts Cain, so the backup Keeper took when Cain's install was registered restarted him and cancelled that install. Now Cain asks Keeper for his backup at your Ship tap, before anything is registered, and the install that follows uses that backup.
+- Each Ship tap has its own one-time code. Keeper names the backup by it, tells Cain when that backup is checked and ready, and lets only the install carrying that same code use it, once. A second tap or a Stop starts a new code, and only the newest counts.
+- Cain's own install never falls back to a second backup any more: if the backup taken at the tap is missing, too old, not checked, already used, from before a restore of Cain, or for a different commit in main than the one that will install, the install is refused with the reason, and a new Ship tap installs it. Other Apps' installs work exactly as before.
+- At most one such backup waits at a time: a newer tap, a refusal, a restore or 15 minutes going by deletes the old one right away. Keeper also refuses to start one when backup storage is low.
+- An older Cain (before 0.19.4) can't install Cain through this Keeper: it says so plainly. Install Cain 0.19.4 once by hand, as RELEASING.md says.
+
 ## 0.1.18
 
 - Fixed: `backup-check` on your Pi stopped at a compressed system log inside Keeper's own software image (`eipp.log.xz`,

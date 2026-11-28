@@ -374,6 +374,66 @@ backup Keeper took at the registration. That covers two windows (0.1.5 says both
 
 Home Assistant itself, `/share` and every other App are left alone.
 
+## Cain backed up first (0.1.19)
+
+Cain's backup is cold: making it stops and starts Cain, and his link with him. Before 0.1.19 Keeper made it
+when Cain's install was registered, and the restarted link cancelled that very registration, so every install
+of Cain failed (Nov 27). Now the backup comes first, and one tap identity runs end to end:
+
+- At Dane's Ship tap for a change that installs Cain, once it is in main, Cain's link reads what will actually
+  install (main's commit and Cain's version there), mints a random tap nonce and a request id, keeps them on disk
+  (left out of Cain's backups) and asks Keeper: `POST /backup-first {app, pr, head, request, nonce, main,
+  to_version}`, Cain's token, Cain's own App only, idempotent by request id. Keeper answers 202 and makes the
+  backup in the background under the name the attempt will have, ending in the nonce's first 8 digits, and checks
+  it as a registration's backup is checked (Cain alone, at the version running now, protected with Keeper's own
+  key). It is refused during a drill, beside an open attempt or an install job with no recorded end, while an
+  operation is late, before the Ship key is confirmed, and when backup storage is low (507, the same free-space
+  reserve as any backup).
+- `GET /backup-first?app=<slug>&request=<id>` is the link's only go: `making`, `ready` with `verified: true`,
+  `failed`, `consumed` or `unknown`, with `restored_at` (the newest restore Keeper can see) and `window_ms`.
+  The link issues the Ship token only on ready and verified for its own request; pending waits within the tap's
+  window; anything else discards the tap. POST's answer never issues it. Every answer carries `backup_first: 1`,
+  which is how Cain's Ship card for himself tells this Keeper from an older one (an older Keeper answers 404).
+- The link consumes the tap crash-safe before the token: the nonce appended to its used list (file and folder
+  synced), the tap file removed (folder synced), then the token.
+- Cain's registration carries `first_nonce` and `first_main`. Keeper uses the backup only for the newest
+  unconsumed nonce, for the same pull request and head, main and version, at the version the install replaces,
+  with its own snapshot time (the backup's date as the Supervisor gives it) within `FIRST_BACKUP_MS` (15 minutes)
+  before the registration, after every restore Keeper can see and after Keeper's state was created. It is
+  consumed once at the registration (its request answers `consumed`), and the claim must name the same main
+  commit again, read by the link right before it claims.
+- Fail closed for Cain's own install: no nonce (a link older than Cain 0.19.4), or a backup first that is missing,
+  stale, unverified, consumed, for another nonce, head, main or version, or from before a restore, refuses the
+  registration with its reason, and a new Ship tap installs it. Keeper never falls back to a backup at the
+  registration for Cain's own ship install. Every other App, and every drill, keeps its backup at the registration.
+- At most one backup first is outstanding. A new request, a refusal, a failure, a restore Keeper sees and the
+  expiry (`FIRST_BACKUP_MS` after the tap) each discard the older one, and its backup is deleted at once by the
+  cleanup, with no grace, never beside an open attempt or an install job.
+- Restores. Any restore of Cain, sent by Keeper or done by hand in Home Assistant, invalidates every pending tap
+  and unconsumed backup first: Keeper reads its own restores and every restore job in the Supervisor's jobs list
+  (any App's, so it fails closed; a jobs list it can't read refuses the registration). The jobs list holds only
+  jobs since the Supervisor last started, so a hand restore before a Supervisor restart isn't seen there; the
+  link's own mark (Cain DOCS, "An update of Cain himself") covers a restore of any backup taken before the tap.
+  A Supervisor restore of an App removes its data folder and copies the backup's in, so files left out of the
+  backup (the tap, the used list) are deleted, not kept (the Supervisor's restore code; not yet watched on the Pi).
+- Timing. One file, `backup-first-timing.ts`, the same bytes in Cain's link and in Keeper (both test suites check
+  it): the tap's window is the backup (4 minutes, Keeper's backup bound) plus Cain's restart (3) plus his session's
+  return (3), 10 minutes; the registration may come up to 5 more minutes after. The restart and session phases are
+  estimates: each phase's measured time is logged on lines with `backup first timing`, so the first real install
+  shows them, and the numbers are set from it.
+
+### Backup first, the one-time install
+
+Keeper 0.1.19 refuses Cain's own install from a link older than Cain 0.19.4, and Cain 0.19.3's link would
+cancel its own install anyway. So the first install of Cain 0.19.4 is done once by hand, after Keeper 0.1.19:
+
+1. Install Keeper 0.1.19 first, through the Ship path as Keeper's own updates go (a backup taken first, no 4a),
+   with no attempt of Cain open.
+2. Then, on Dane's word at the device, update Cain to 0.19.4 from Home Assistant's own page with "Back up before
+   updating" on, once Keeper's log shows no live claim. Keeper sees it as unprotected (no claim): nothing is rolled
+   back for it, and the Home Assistant backup is the way back.
+3. From then on, Cain's updates go through the Ship tap, backed up first.
+
 ## Keeper's own install and updates (0.1.5)
 
 Keeper doesn't gate its own install or updates: an install or update of Keeper goes through the normal
